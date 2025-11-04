@@ -1,103 +1,118 @@
-# Understanding Synchronous, Asynchronous, Concurrent, and Parallel Processing in Kotlin
+# 同期処理、非同期処理、並行処理、並列処理の違い
 
-In today's software development landscape, understanding the concepts of synchronous, asynchronous, concurrent, and parallel processing is crucial for writing efficient and responsive applications. In this article, we will explore these concepts with practical Kotlin code samples.
+よくジュニアメンバーの方たちから、このあたりの誤解、混同した会話が聞こえてくる。
 
-## Synchronous Processing
+自分も初め混乱したなぁと思いつつ、お伝えした内容をまとめておく。
 
-Synchronous processing refers to tasks that are executed sequentially, where each task must complete before the next one begins. This means that if a task is blocking (e.g., waiting for a response from a network call), the entire execution will halt until that task is done.
+## 同期処理
+一つ一つ処理していく形式。
+前の処理の終了しないと次には進まない
 
-### Example: Synchronous Function in Kotlin
+ホールスタッフのAさんが一つの注文を受け取り、厨房にそれを伝える。厨房から料理が出てくるまでぼーっとしてる
+
+料理が待ち時間なく厨房から提供されるなら良いが、それなりに待つならとても効率が悪い。
+
+実装としては
 
 ```kotlin
-fun fetchData(): String {
-    // Simulates a blocking call
-    Thread.sleep(1000) // Simulates a delay
-    return "Data Retrieved"
-}
-
-fun main() {
-    println("Start fetching...")
-    val result = fetchData()
-    println(result)
-    println("Fetching complete.")
+// 同期処理の例
+fun fetchUserSync(userId: Int): User {
+    val response = fetchFromAPI(userId) // ここで待つ
+    println(response)
+    processData(response) // これはresponseが来るまで実行されない
+    return response
 }
 ```
 
-In this example, the `fetchData` function simulates a delay using `Thread.sleep()`, blocking the `main` thread until the operation is complete.
+のようになり、APIやDBからレスポンスが来ないとそれ以降の処理はしないという物
 
-## Asynchronous Processing
+テキトーに書くと大体同期処理になっちゃいます
 
-Asynchronous processing allows a program to initiate a task and continue executing other tasks without waiting for the first task to finish. This is especially useful in scenarios where I/O-bound operations (like network calls) can be performed in the background.
+## 非同期処理とは
+前の処理結果を待たずに、次の処理を進める処理方式
 
-### Example: Asynchronous Function in Kotlin using Coroutines
+## 並行処理とは
+同時に複数のタスクをこなしているように見せる処理方式。非同期処理を実現するために用いられる。
+同時に複数タスクを実行してはいない。
 
-Kotlin Coroutines provide a way to write asynchronous code in a sequential manner.
+ホールスタッフAさんが厨房からの料理提供時間を待ってる間、他の注文を取りに行く。
+これが非同期処理である。
+
+代表的な利用ケースはI/Oなどだ
+
+実装としては
 
 ```kotlin
-import kotlinx.coroutines.*
-
-suspend fun fetchDataAsync(): String {
-    delay(1000) // Non-blocking delay
-    return "Data Retrieved"
+// 並行処理の例（Kotlin Coroutine）
+suspend fun fetchUserAsync(userId: Int): User {
+    val response = fetchFromAPIAsync(userId) // ここで待つが、他の処理は続く
+    println(response)
+    processData(response)
+    return response
 }
 
-fun main() = runBlocking {
-    println("Start fetching...")
-    val result = fetchDataAsync()
-    println(result)
-    println("Fetching complete.")
+// 複数の非同期処理を並行実行
+GlobalScope.launch {
+    val user1 = async { fetchUserAsync(1) }
+    val user2 = async { fetchUserAsync(2) }
+    val user3 = async { fetchUserAsync(3) }
+    
+    // すべての結果を待つ（または個別に結果を取得）
+    val results = awaitAll(user1, user2, user3)
+    println(results)
 }
 ```
 
-In the above code, `fetchDataAsync` uses `delay` instead of `Thread.sleep`, allowing the main thread to continue executing other tasks if any are present. The `runBlocking` function is used to block the main thread until the coroutine completes, but it does not block the coroutine itself.
+となる。お互いに依存関係のない処理なので待たずに行っている。
 
-## Concurrent Processing
+前述の通り、実際は複数のタスクを切り替えながら、待ち時間で他タスクを行なっているだけである。
 
-Concurrent processing involves multiple tasks making progress simultaneously, but it does not necessarily mean that they are executing at the same moment. Tasks can be interleaved, as the CPU switches between them. This is commonly achieved using threads.
+### 代表的な並行処理の技術
+- Kotlin Coroutine
+- WebFlux（Spring Reactor）
+- Python asyncio
 
-### Example: Concurrent Processing using Threads
+## 並列処理とは
+複数スレッドを立てるなどして、実際に同時に複数のタスクを処理する形式。
+非同期処理を実現するために用いられる。
 
-```kotlin
-fun main() {
-    println("Start fetching...")
-    val thread1 = Thread { println("Data from thread 1") }
-    val thread2 = Thread { println("Data from thread 2") }
+ホールスタッフの例で言えば、Aさん以外にB,Cさんにも任せる形になると並列処理といえる
+ただ、並行処理とは別物なので一人一人が厨房からの料理の提供をボーッと待ってても並列処理といえる
 
-    thread1.start()
-    thread2.start()
-
-    thread1.join() // wait for thread1 to finish
-    thread2.join() // wait for thread2 to finish
-    println("Fetching complete.")
-}
-```
-
-In this case, two threads are started to perform tasks concurrently. The `join()` method ensures the main thread waits for both threads to finish before proceeding.
-
-## Parallel Processing
-
-Parallel processing refers to the simultaneous execution of tasks, which is possible on multi-core processors. This is where tasks are not just overlapping, but literally running at the same time on different CPU cores.
-
-### Example: Parallel Processing with Kotlin Coroutines and Dispatchers
+実装としては
 
 ```kotlin
-import kotlinx.coroutines.*
+// 並列処理の例（Kotlin マルチスレッド）
+val executor = Executors.newFixedThreadPool(3)
 
-fun main() = runBlocking {
-    println("Start fetching...")
-    val jobs = (1..4).map { index ->
-        launch(Dispatchers.Default) {
-            delay(1000) // Simulates a time-consuming operation
-            println("Completed fetching from task $index")
-        }
-    }
-    jobs.forEach { it.join() }
-    println("Fetching complete.")
+executor.submit {
+    fetchUserAndProcess(1)
 }
+executor.submit {
+    fetchUserAndProcess(2)
+}
+executor.submit {
+    fetchUserAndProcess(3)
+}
+
+executor.shutdown()
+executor.awaitTermination(1, TimeUnit.MINUTES)
 ```
 
-In this example, `Dispatchers.Default` allows the coroutines to be executed in parallel on multiple threads if the system has available cores to do so. Each task runs concurrently, and they can all complete in a shorter amount of time than the same tasks running synchronously.
+### 代表的な並列処理の技術
+- Kotlin マルチスレッド（Thread）
+- Java ExecutorService
+- Python multiprocessing
 
-## Conclusion
+## それぞれいつ使うべきか？
 
-Understanding the distinctions between synchronous, asynchronous, concurrent, and parallel processing is essential for creating responsive applications. With the help of Kotlin's Coroutines, developers can write easy-to-read code for handling asynchronous and concurrent tasks while leveraging parallel processing capabilities where appropriate.
+| 処理方式 | 使用場面 | メリット | デメリット |
+|---------|---------|---------|---------|
+| **同期処理** | 処理の依存関係が強い場合、シンプルな実装 | 実装が簡単、デバッグが容易 | 待機時間が多いと効率が悪い |
+| **並行処理** | I/O待機が多い場合（API呼び出し、DB検索など）、単一スレッド環境 | リソース効率が良い、実装も比較的簡単 | CPU集約的なタスクには不向き |
+| **並列処理** | CPU集約的な処理（大量計算、画像処理など）、複数スレッド環境対応 | 本当の意味で同時実行、高速化が期待できる | 実装が複雑、スレッドセーフ対策が必要 |
+
+## まとめ
+重要な概念なのに混同しやすいのでまとめてみました。
+
+以上の説明のホールスタッフ　= スレッドと読みかえ、再度上から読み直せば技術の話としても理解できるでしょう。
