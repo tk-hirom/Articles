@@ -68,7 +68,7 @@ GlobalScope.launch {
 前述の通り、実際は複数のタスクを切り替えながら、待ち時間で他タスクを行なっているだけである。
 
 ### 代表的な並行処理の技術
-- Kotlin Coroutine✖️WebFlux（Spring Reactor）
+- Kotlin Coroutine
 - Python asyncio
 
 ## 並列処理とは
