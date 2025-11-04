@@ -68,7 +68,7 @@ GlobalScope.launch {
 前述の通り、実際は複数のタスクを切り替えながら、待ち時間で他タスクを行なっているだけである。
 
 ### 代表的な並行処理の技術
-- Kotlin Coroutine✖️WebFlux（Spring Reactor）
+- Kotlin Coroutine
 - Python asyncio
 
 ## 並列処理とは
@@ -101,6 +101,35 @@ executor.awaitTermination(1, TimeUnit.MINUTES)
 ### 代表的な並列処理の技術
 - Kotlin マルチスレッド（Thread）
 - Java ExecutorService
+
+## 並行処理かつ並列処理
+実際の開発では、並行処理と並列処理の両方の特徴を持つ技術も存在する。
+これらは非同期処理の仕組み（並行処理）を使いながら、実際の実行では複数スレッドやプロセスを活用して並列実行も行う。
+
+### 代表例
+
+#### Kotlin Coroutines with Dispatchers
+Kotlin Coroutinesは、非同期処理を実現するための軽量な並行処理の仕組みである。
+Dispatcherを使うことで、コルーチンを異なるスレッドプールで実行でき、並行処理と並列処理の両方を実現できる。
+
+```kotlin
+// Kotlin Coroutinesの例
+@RestController
+class UserController(private val userService: UserService) {
+    
+    @GetMapping("/users")
+    suspend fun getUsers(): List<User> {
+        // 複数ユーザーを非同期かつ並列で取得
+        return coroutineScope {
+            (1..3).map { userId ->
+                async(Dispatchers.IO) { // IOスレッドプールで並列実行
+                    userService.fetchUserAsync(userId)
+                }
+            }.awaitAll()
+        }
+    }
+}
+```
 
 ## それぞれいつ使うべきか？
 
