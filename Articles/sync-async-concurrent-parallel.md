@@ -1,0 +1,1 @@
+# Updated content including JavaScript and hybrid processing section
