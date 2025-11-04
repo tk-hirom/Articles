@@ -101,7 +101,6 @@ executor.awaitTermination(1, TimeUnit.MINUTES)
 ### 代表的な並列処理の技術
 - Kotlin マルチスレッド（Thread）
 - Java ExecutorService
-- Python multiprocessing
 
 ## それぞれいつ使うべきか？
 
