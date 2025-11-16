@@ -1,4 +1,10 @@
-# Prismaとは何か〜実務でどう実装するかまで　to Next.js初心者
+---
+title: "Prismaとは何か〜実務でどう実装するかまで　to Next.js初心者"
+emoji: "🗄️"
+type: "tech" # tech: 技術記事 / idea: アイデア
+topics: ["prisma", "nextjs", "typescript", "orm", "database"]
+published: false
+---
 
 ## はじめに
 
