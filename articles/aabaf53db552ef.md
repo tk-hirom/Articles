@@ -8,13 +8,15 @@ published: false
 
 # はじめに
 
-Kotlinのコルーチン（Coroutine）は、非同期処理を簡潔に書けるKotlinの強力な機能です。公式ドキュメントを読んでも「よくわからない...」と感じる方も多いと思います。この記事では、コルーチンの基本概念を身近な例を使って噛み砕いて説明します。
+現在、Webfluxの刷新プロジェクトを担当しており、Kotlin Coroutineを活用しています。Coroutineを使えば同期的に書けるコードでありながら、並行処理のメリットを享受できる点に大きな魅力を感じていました。しかし、実際に使っていく中で「雰囲気で触っているだけで、本質を理解できていないのでは？」という疑問が湧いてきました。そこで、公式ドキュメントや関連資料を改めてさらい、基礎から学び直すことにしました。
 
-## コルーチンって何？なぜ必要なの？
+この記事では、Kotlinのコルーチン（Coroutine）の基本概念を身近な例を使って噛み砕いて説明します。公式ドキュメントを読んでも「よくわからない...」と感じる方の理解の助けになれば幸いです。
 
-### 問題：時間のかかる処理でアプリが固まる
+## コルーチンの概要と必要性
 
-例えば、ネットワークからデータを取得する処理を考えてみましょう。普通に書くとこうなります：
+### 同期的なコードの問題
+
+まず、最もシンプルな同期的なコードから見てみましょう。ネットワークからデータを取得する処理を考えてみます：
 
 ```kotlin
 fun loadUserData() {
@@ -23,107 +25,371 @@ fun loadUserData() {
 }
 ```
 
-この問題点は、`fetchFromNetwork()` の3秒間、アプリが完全にフリーズしてしまうことです。ユーザーは何も操作できず、「アプリが壊れた？」と思ってしまいます。
+このコードは一見シンプルで分かりやすいですが、致命的な問題があります。`fetchFromNetwork()` が完了するまでの3秒間、プログラム全体が完全に停止してしまうのです。
 
-### 従来の解決策：スレッド
+この問題を解決するには、時間のかかる処理を**非同期**で実行する必要があります。つまり、データ取得を待っている間も、他の処理を継続できるようにするということです。
 
-従来はスレッドを使って別の処理フローで実行していました：
+### 従来のアプローチ：スレッドによる非同期処理
+
+この問題に対する伝統的な解決策は、スレッドを使って処理を別のスレッドで実行することでした：
 
 ```kotlin
-// 普通のスレッド（重い）
 thread {
     val data = fetchFromNetwork() // 別スレッドで実行
-    // でも、ここでUIを更新できない！（メインスレッドじゃないから）
     runOnUiThread {
         showData(data) // UIスレッドに戻る必要がある
     }
 }
 ```
 
-スレッドには以下の問題があります：
-- **重い**: スレッド1つで約1MB〜2MBのメモリを消費
-- **数に限界**: せいぜい数百個しか作れない
-- **切り替えコスト**: スレッド間の切り替えは時間がかかる
-- **複雑**: スレッド間の通信やUIスレッドへの戻し方が面倒
+この方法で、メインスレッド（UIスレッド）をブロックせずに処理を実行できます。しかし、スレッドには以下のような深刻な制約があります：
 
-### コルーチンの解決策
+**リソースの制約**：
 
-コルーチンを使うとこうなります：
+- **メモリ消費が大きい**: スレッド1つあたり約1MB〜2MBのメモリを消費
+- **数に限界がある**: 実用的には数百個〜数千個程度しか作成できない
+- **コンテキストスイッチのコスト**: スレッド間の切り替えはCPUに負荷をかける
 
-```kotlin
-// コルーチン（軽い＆シンプル）
-// 注：実際のアプリではviewModelScopeやlifecycleScopeを使う
-viewModelScope.launch {
-    val data = fetchFromNetwork() // 一時停止して待つ
-    showData(data) // 自動的に適切なスレッドで実行
-}
-```
+**開発の複雑さ**：
 
-**コルーチンを一言で表すと**：「途中で一時停止・再開できる、めちゃくちゃ軽量な処理の単位」です。
+- スレッド間の通信が煩雑
+- UIスレッドへの切り戻しを明示的に行う必要がある
+- エラーハンドリングやキャンセル処理が複雑になりがち
 
-### コルーチンの3つの魔法
+### スレッドの限界：スケーラビリティの問題
 
-1. **超軽量**
-   - 1つあたり数十バイト程度
-   - 数万〜数十万個を同時に動かせる
-   - 例：10万件の処理を並行実行しても問題なし
+特にサーバーサイドのアプリケーションでは、この制約が致命的な問題となります。
 
-2. **一時停止機能**
-   - `delay(1000)` で1秒待つ間、スレッドを占有しない
-   - その間に他のコルーチンが動ける
-   - レストランの例：注文を受けて料理ができるまで待つ間、他のお客さんの対応ができる
+例えば、1万件の同時接続を処理する必要がある場合（いわゆるC10K問題）を考えてみましょう。各接続に1つのスレッドを割り当てるアプローチでは：
 
-3. **構造化された並行性**
-   - 親コルーチンがキャンセルされると、子も自動的にキャンセル
-   - メモリリークの心配が減る
-   - 画面を閉じたら、その画面で動いていた処理も自動的に止まる
+- **メモリ消費**: 10,000スレッド × 2MB = 約20GBのメモリが必要
+- **コンテキストスイッチのオーバーヘッド**: 大量のスレッド間の切り替えでCPUリソースが枯渇
+- **スケーラビリティの限界**: 接続数が増えるほどパフォーマンスが急激に悪化
 
-### 具体的な比較
+この問題に対処するため、従来はイベントループやノンブロッキングI/Oといった複雑なアーキテクチャパターンが必要でした。しかし、これらのアプローチはコードを複雑にし、理解や保守を困難にします。
 
-同じ「1秒待つ」処理でも、内部では全く違うことが起きています：
+これらの問題に対処できるのがコルーチンです。
 
-```kotlin
-// Thread.sleep(1000)の場合
-// → スレッドを1秒間「占有」= その間そのスレッドは何もできない
-// → 1000個のスレッドでやったらメモリが1〜2GB必要
+### 解決策：コルーチンによる軽量な非同期処理
 
-thread {
-    Thread.sleep(1000) // このスレッドは1秒間寝る
-    println("完了")
-}
+Kotlin Coroutineは、スレッドの制約を克服しつつ、シンプルなコードで非同期処理を実現する仕組みです。「途中で一時停止・再開できる、軽量な処理の単位」と言い換えられます・
 
-// delay(1000)の場合
-// → スレッドは「解放」= その間他のコルーチンが使える
-// → 10万個のコルーチンでやってもメモリは数MB程度
+コルーチンは、スレッドの問題を以下のように解決します：
 
-launch {
-    delay(1000) // スレッドを手放して1秒後に再開
-    println("完了")
-}
-```
+**1. 圧倒的な軽量性**
+
+- 1つあたり数十バイト程度のメモリ消費
+- 数万〜数十万個のコルーチンを同時に実行可能
+- 10万件の同時接続も現実的に処理できる
+
+**2. 効率的なリソース利用**
+
+- `delay(1000)` で1秒待つ間、スレッドを占有しない
+- 待機中のスレッドは他のコルーチンが利用できる
+- 少数のスレッドで大量の並行処理を実現
+
+**3. 構造化された並行性**
+
+- 親コルーチンがキャンセルされると、子も自動的にキャンセル
+- メモリリークを防ぐライフサイクル管理が組み込まれている
+- 画面を閉じたら、その画面の処理も自動的に停止
+
+コルーチンを使うことで、スレッドのような複雑さを避けながら、スケーラブルで効率的な非同期処理を実現できます。次のセクションでは、コルーチンの基本構成要素を詳しく見ていきましょう。
 
 ## コルーチンの基本構成要素
 
 コルーチンを使いこなすには、3つの基本要素を理解する必要があります。順番に見ていきましょう。
 
-### 1. suspend関数：「一時停止できる関数」の目印
+### 1. CoroutineScope：コルーチンの「実行範囲」を定義
+
+CoroutineScopeは「コルーチンの寿命を管理する枠組み」です。これが理解できると、メモリリークを防げます。
+
+#### なぜScopeが必要なのか？
+
+例えば、Androidアプリで画面を開いた時にデータ取得を開始したとします：
+
+```kotlin
+// ❌ 悪い例
+class UserActivity : AppCompatActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        
+        GlobalScope.launch {
+            val data = fetchUserData() // 10秒かかる
+            showData(data) // データを表示
+        }
+    }
+}
+```
+
+問題：ユーザーが3秒後に画面を閉じたら？
+
+- コルーチンはまだ動いている（あと7秒残ってる）
+- 画面はもう無い
+- `showData(data)`を呼ぶとクラッシュ！
+
+**解決策：CoroutineScopeで寿命を管理**
+
+```kotlin
+// ✅ 良い例
+class UserActivity : AppCompatActivity(), CoroutineScope {
+    // このActivityのためのJobを作る
+    private val job = Job()
+    
+    // CoroutineScopeの実装（Mainスレッドで実行）
+    override val coroutineContext = Dispatchers.Main + job
+    
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        
+        // このActivityのスコープでコルーチンを起動
+        launch {
+            val data = fetchUserData() // 10秒かかる
+            showData(data)
+        }
+    }
+    
+    override fun onDestroy() {
+        super.onDestroy()
+        job.cancel() // Activityが破棄される時に全コルーチンをキャンセル
+    }
+}
+```
+
+これで、画面を閉じると自動的にコルーチンもキャンセルされます。
+
+#### ViewModelScopeとLifecycleScopeの便利さ
+
+Androidでは、もっと簡単な方法が用意されています：
+
+```kotlin
+// ViewModelの場合
+class UserViewModel : ViewModel() {
+    fun loadData() {
+        viewModelScope.launch { // ViewModelが破棄されると自動キャンセル
+            val data = fetchUserData()
+            _uiState.value = data
+        }
+    }
+}
+
+// Activity/Fragmentの場合
+class UserFragment : Fragment() {
+    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
+        super.onViewCreated(view, savedInstanceState)
+        
+        lifecycleScope.launch { // Fragmentのライフサイクルに連動
+            val data = fetchUserData()
+            showData(data)
+        }
+    }
+}
+```
+
+**覚えておくべきこと**：
+
+- `GlobalScope`：**⚠️ 本番コードでは使用禁止**（理由は後述）
+- `viewModelScope`：ViewModelが破棄されたら自動キャンセル（推奨）
+- `lifecycleScope`：画面のライフサイクルに連動して自動キャンセル（推奨）
+- 独自のScope：自分で`Job()`を作って管理する
+
+### 2. コルーチンビルダー：コルーチンを「起動」する関数
+
+コルーチンを起動するための関数がコルーチンビルダーです。主に3つあります。
+
+#### launch：「起動して、結果は気にしない」
+
+`launch`は「とにかく実行して！結果は要らない！」という時に使います。
+
+```kotlin
+fun main() = runBlocking {
+    println("プログラム開始")
+    
+    // launchで新しいコルーチンを起動
+    launch {
+        delay(1000) // 1秒待つ
+        println("1秒後のメッセージ")
+    }
+    
+    println("launchの後すぐ実行される")
+    // プログラム開始
+    // launchの後すぐ実行される
+    // （1秒後）1秒後のメッセージ
+}
+```
+
+**launchの特徴**：
+
+- 戻り値は `Job`（ジョブ＝処理の管理チケット）
+- 処理の結果を返さない（返せない）
+- 「ログ出力」「データ保存」など、結果が不要な処理に最適
+
+**Jobで何ができるか**：
+
+```kotlin
+val job = launch {
+    repeat(10) {
+        println("処理中... $it")
+        delay(500)
+    }
+}
+
+// 他の処理...
+
+job.cancel() // 処理をキャンセル
+// または
+job.join() // 処理の完了を待つ
+// または
+job.cancelAndJoin() // キャンセルして完了を待つ
+```
+
+#### async / await：「起動して、結果を受け取りたい」
+
+`async`は「実行して、後で結果が欲しい！」という時に使います。
+
+```kotlin
+fun main() = runBlocking {
+    println("計算開始")
+    
+    // asyncで計算を開始（Deferredを返す）
+    val deferred = async {
+        delay(1000) // 重い計算を模擬
+        42 // 計算結果
+    }
+    
+    println("計算は別で動いてる。他の処理もできる")
+    delay(500)
+    println("500msec経過")
+    
+    // awaitで結果を取得（まだ終わってなければ待つ）
+    val result = deferred.await()
+    println("計算結果: $result")
+}
+```
+
+**出力**：
+
+```
+計算開始
+計算は別で動いてる。他の処理もできる
+500msec経過
+計算結果: 42
+```
+
+**async/awaitの使い分け**：
+
+```kotlin
+// ❌ こうすると遅い（逐次実行）
+suspend fun fetchDataSlow(): Pair<User, List<Post>> {
+    val user = fetchUser() // 1秒かかる
+    val posts = fetchPosts() // 1秒かかる
+    return user to posts
+    // 合計2秒
+}
+
+// ✅ asyncを使うと速い（並列実行）
+suspend fun fetchDataFast(): Pair<User, List<Post>> = coroutineScope {
+    // 2つを「同時に」開始
+    val userDeferred = async { fetchUser() } // 1秒かかる
+    val postsDeferred = async { fetchPosts() } // 1秒かかる
+    
+    // 両方の結果を待つ
+    val user = userDeferred.await()
+    val posts = postsDeferred.await()
+    
+    return@coroutineScope user to posts
+    // 合計1秒（並列実行されるから）
+}
+```
+
+**レストランの例で理解する**：
+
+- `launch`: 「料理を作っておいて（結果は要らない）」
+- `async/await`: 「料理を作っておいて、できたら持ってきて（結果が欲しい）」
+
+#### runBlocking：「普通の世界とコルーチンの世界を繋ぐ」
+
+`runBlocking`は特殊なビルダーで、「コルーチンじゃない普通の関数」から「コルーチンの世界」に入るための橋渡しです。
+
+```kotlin
+// 普通の関数（コルーチンじゃない）
+fun main() = runBlocking { // ← ここでコルーチンの世界に入る
+    // ここからコルーチンの世界
+    launch {
+        delay(1000)
+        println("完了")
+    }
+    println("待機中")
+} // ← ここで、中のコルーチンが全部終わるまで待つ
+```
+
+**runBlockingの特徴と使用上の注意**：
+
+- 中のコルーチンが全て終わるまで、呼び出したスレッドをブロック（待機）する
+- **⚠️ 本番のアプリコードでは使わない**（スレッドをブロックするため）
+- **使うべき場面**：
+  - `main`関数（学習用のサンプルコード）
+  - テストコード
+  - 既存の同期的なコードとの橋渡し
+
+**なぜ本番コードで避けるべき？**
+
+`runBlocking`は名前の通り、スレッドを「ブロック」します。特にAndroidアプリでメインスレッドで`runBlocking`を使うと、UIがフリーズする原因になります。
+
+```kotlin
+// ❌ 悪い例：メインスレッドをブロックする
+class MainActivity : AppCompatActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        
+        runBlocking { // メインスレッドが3秒間フリーズ！
+            delay(3000)
+            loadData()
+        }
+    }
+}
+
+// ✅ 良い例：適切なスコープを使う
+class MainActivity : AppCompatActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        
+        lifecycleScope.launch { // メインスレッドをブロックしない
+            delay(3000)
+            loadData()
+        }
+    }
+}
+```
+
+**使用例：テストコード（これは適切な使用例）**
+
+```kotlin
+@Test
+fun testSuspendFunction() = runBlocking {
+    // テストでは問題ない（テストスレッドをブロックするだけ）
+    val result = fetchUser("123")
+    assertEquals("太郎", result.name)
+}
+```
+
+### 3. suspend関数：「一時停止できる関数」の目印
 
 `suspend` キーワードは「この関数は途中で一時停止するかもしれない」という目印です。
 
+そして、一時停止している間は**スレッドを解放**できるという重要な特徴があります。これにより、そのスレッドは他のコルーチンが利用できるようになります。
+
 #### なぜsuspendが必要なのか？
 
-普通の関数は「開始したら終わるまで一気に実行」されます。でも、ネットワーク通信のように「結果が返ってくるまで待つ」処理では、その待ち時間にスレッドを占有するのはもったいないですよね。
+ネットワーク通信のように「結果が返ってくるまで待つ」処理では、その待ち時間にスレッドを占有するのはもったいないですよね。
 
 ```kotlin
-// 普通の関数（一気に実行される）
-fun add(a: Int, b: Int): Int {
-    return a + b // 瞬時に終わる
-}
-
 // suspend関数（途中で一時停止できる）
 suspend fun fetchUserData(): User {
-    delay(1000) // ← ここで一時停止（スレッドは解放される）
-    return User("太郎") // 1秒後に再開してここが実行される
+    return withContext(Dispatchers.IO) {
+        delay(1000) // ← ここで一時停止（スレッドは解放される）
+        apiService.getUser() // ネットワーク通信
+    }
 }
 ```
 
@@ -188,378 +454,10 @@ class UserViewModel : ViewModel() {
 ```
 
 この例のポイント：
+
 - `fetchUser`と`fetchPosts`は両方とも suspend関数
 - 呼び出し側から見ると、普通の関数のように「順番に」書ける
 - でも内部では、待っている間スレッドを解放して他の処理ができる
-
-### 2. コルーチンビルダー：コルーチンを「起動」する関数
-
-suspend関数を呼ぶには、まずコルーチンを起動する必要があります。そのための関数がコルーチンビルダーです。主に3つあります。
-
-#### launch：「起動して、結果は気にしない」
-
-`launch`は「とにかく実行して！結果は要らない！」という時に使います。
-
-```kotlin
-fun main() = runBlocking {
-    println("プログラム開始")
-    
-    // launchで新しいコルーチンを起動
-    launch {
-        delay(1000) // 1秒待つ
-        println("1秒後のメッセージ")
-    }
-    
-    println("launchの後すぐ実行される")
-    // プログラム開始
-    // launchの後すぐ実行される
-    // （1秒後）1秒後のメッセージ
-}
-```
-
-**launchの特徴**：
-- 戻り値は `Job`（ジョブ＝処理の管理チケット）
-- 処理の結果を返さない（返せない）
-- 「ログ出力」「データ保存」など、結果が不要な処理に最適
-
-**Jobで何ができるか**：
-
-```kotlin
-val job = launch {
-    repeat(10) {
-        println("処理中... $it")
-        delay(500)
-    }
-}
-
-// 他の処理...
-
-job.cancel() // 処理をキャンセル
-// または
-job.join() // 処理の完了を待つ
-// または
-job.cancelAndJoin() // キャンセルして完了を待つ
-```
-
-#### async / await：「起動して、結果を受け取りたい」
-
-`async`は「実行して、後で結果が欲しい！」という時に使います。
-
-```kotlin
-fun main() = runBlocking {
-    println("計算開始")
-    
-    // asyncで計算を開始（Deferredを返す）
-    val deferred = async {
-        delay(1000) // 重い計算を模擬
-        42 // 計算結果
-    }
-    
-    println("計算は別で動いてる。他の処理もできる")
-    delay(500)
-    println("500msec経過")
-    
-    // awaitで結果を取得（まだ終わってなければ待つ）
-    val result = deferred.await()
-    println("計算結果: $result")
-}
-```
-
-**出力**：
-```
-計算開始
-計算は別で動いてる。他の処理もできる
-500msec経過
-計算結果: 42
-```
-
-**async/awaitの使い分け**：
-
-```kotlin
-// ❌ こうすると遅い（逐次実行）
-suspend fun fetchDataSlow(): Pair<User, List<Post>> {
-    val user = fetchUser() // 1秒かかる
-    val posts = fetchPosts() // 1秒かかる
-    return user to posts
-    // 合計2秒
-}
-
-// ✅ asyncを使うと速い（並列実行）
-suspend fun fetchDataFast(): Pair<User, List<Post>> = coroutineScope {
-    // 2つを「同時に」開始
-    val userDeferred = async { fetchUser() } // 1秒かかる
-    val postsDeferred = async { fetchPosts() } // 1秒かかる
-    
-    // 両方の結果を待つ
-    val user = userDeferred.await()
-    val posts = postsDeferred.await()
-    
-    return@coroutineScope user to posts
-    // 合計1秒（並列実行されるから）
-}
-```
-
-**レストランの例で理解する**：
-- `launch`: 「料理を作っておいて（結果は要らない）」
-- `async/await`: 「料理を作っておいて、できたら持ってきて（結果が欲しい）」
-
-#### runBlocking：「普通の世界とコルーチンの世界を繋ぐ」
-
-`runBlocking`は特殊なビルダーで、「コルーチンじゃない普通の関数」から「コルーチンの世界」に入るための橋渡しです。
-
-```kotlin
-// 普通の関数（コルーチンじゃない）
-fun main() = runBlocking { // ← ここでコルーチンの世界に入る
-    // ここからコルーチンの世界
-    launch {
-        delay(1000)
-        println("完了")
-    }
-    println("待機中")
-} // ← ここで、中のコルーチンが全部終わるまで待つ
-```
-
-**runBlockingの特徴と使用上の注意**：
-- 中のコルーチンが全て終わるまで、呼び出したスレッドをブロック（待機）する
-- **⚠️ 本番のアプリコードでは使わない**（スレッドをブロックするため）
-- **使うべき場面**：
-  - `main`関数（学習用のサンプルコード）
-  - テストコード
-  - 既存の同期的なコードとの橋渡し
-
-**なぜ本番コードで避けるべき？**
-
-`runBlocking`は名前の通り、スレッドを「ブロック」します。特にAndroidアプリでメインスレッドで`runBlocking`を使うと、UIがフリーズする原因になります。
-
-```kotlin
-// ❌ 悪い例：メインスレッドをブロックする
-class MainActivity : AppCompatActivity() {
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        
-        runBlocking { // メインスレッドが3秒間フリーズ！
-            delay(3000)
-            loadData()
-        }
-    }
-}
-
-// ✅ 良い例：適切なスコープを使う
-class MainActivity : AppCompatActivity() {
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        
-        lifecycleScope.launch { // メインスレッドをブロックしない
-            delay(3000)
-            loadData()
-        }
-    }
-}
-```
-
-**使用例：テストコード（これは適切な使用例）**
-
-```kotlin
-@Test
-fun testSuspendFunction() = runBlocking {
-    // テストでは問題ない（テストスレッドをブロックするだけ）
-    val result = fetchUser("123")
-    assertEquals("太郎", result.name)
-}
-```
-
-### 3. CoroutineScope：コルーチンの「実行範囲」を定義
-
-CoroutineScopeは「コルーチンの寿命を管理する枠組み」です。これが理解できると、メモリリークを防げます。
-
-#### なぜScopeが必要なのか？
-
-例えば、Androidアプリで画面を開いた時にデータ取得を開始したとします：
-
-```kotlin
-// ❌ 悪い例
-class UserActivity : AppCompatActivity() {
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        
-        GlobalScope.launch {
-            val data = fetchUserData() // 10秒かかる
-            showData(data) // データを表示
-        }
-    }
-}
-```
-
-問題：ユーザーが3秒後に画面を閉じたら？
-- コルーチンはまだ動いている（あと7秒残ってる）
-- 画面はもう無い
-- `showData(data)`を呼ぶとクラッシュ！
-
-**解決策：CoroutineScopeで寿命を管理**
-
-```kotlin
-// ✅ 良い例
-class UserActivity : AppCompatActivity(), CoroutineScope {
-    // このActivityのためのJobを作る
-    private val job = Job()
-    
-    // CoroutineScopeの実装（Mainスレッドで実行）
-    override val coroutineContext = Dispatchers.Main + job
-    
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-        
-        // このActivityのスコープでコルーチンを起動
-        launch {
-            val data = fetchUserData() // 10秒かかる
-            showData(data)
-        }
-    }
-    
-    override fun onDestroy() {
-        super.onDestroy()
-        job.cancel() // Activityが破棄される時に全コルーチンをキャンセル
-    }
-}
-```
-
-これで、画面を閉じると自動的にコルーチンもキャンセルされます。
-
-#### ViewModelScopeとLifecycleScopeの便利さ
-
-Androidでは、もっと簡単な方法が用意されています：
-
-```kotlin
-// ViewModelの場合
-class UserViewModel : ViewModel() {
-    fun loadData() {
-        viewModelScope.launch { // ViewModelが破棄されると自動キャンセル
-            val data = fetchUserData()
-            _uiState.value = data
-        }
-    }
-}
-
-// Activity/Fragmentの場合
-class UserFragment : Fragment() {
-    override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
-        super.onViewCreated(view, savedInstanceState)
-        
-        lifecycleScope.launch { // Fragmentのライフサイクルに連動
-            val data = fetchUserData()
-            showData(data)
-        }
-    }
-}
-```
-
-**覚えておくべきこと**：
-- `GlobalScope`：**⚠️ 本番コードでは使用禁止**（理由は後述）
-- `viewModelScope`：ViewModelが破棄されたら自動キャンセル（推奨）
-- `lifecycleScope`：画面のライフサイクルに連動して自動キャンセル（推奨）
-- 独自のScope：自分で`Job()`を作って管理する
-
-#### GlobalScopeを使ってはいけない理由
-
-`GlobalScope`は「アプリケーションのライフサイクルと同じ寿命を持つスコープ」です。つまり、アプリが終了するまでキャンセルされません。
-
-**問題点**：
-
-1. **メモリリークの原因**
-```kotlin
-// ❌ 悪い例
-class UserFragment : Fragment() {
-    fun loadData() {
-        GlobalScope.launch {
-            val data = fetchUserData() // 10秒かかる
-            updateUI(data) // Fragmentが既に破棄されていたらクラッシュ
-        }
-    }
-}
-// ユーザーが画面を閉じても、コルーチンは動き続ける
-// Fragmentへの参照が残り、メモリリークが発生
-```
-
-2. **リソースの無駄遣い**
-```kotlin
-// ❌ 悪い例
-GlobalScope.launch {
-    while (true) {
-        val data = fetchData() // 1秒ごとにデータ取得
-        updateUI(data)
-        delay(1000)
-    }
-}
-// ユーザーが画面を閉じても、永遠にAPIを叩き続ける
-// バッテリーとネットワーク帯域の無駄
-```
-
-3. **テストが困難**
-```kotlin
-// GlobalScopeはテスト時にコントロールできない
-// テストが終了してもコルーチンが動き続ける可能性がある
-```
-
-**正しい代替案**：
-
-```kotlin
-// ✅ ViewModelの場合
-class UserViewModel : ViewModel() {
-    fun loadData() {
-        viewModelScope.launch {
-            // ViewModelが破棄されたら自動的にキャンセル
-            val data = fetchUserData()
-            _uiState.value = data
-        }
-    }
-}
-
-// ✅ Fragment/Activityの場合
-class UserFragment : Fragment() {
-    fun loadData() {
-        lifecycleScope.launch {
-            // Fragmentのライフサイクルに連動
-            val data = fetchUserData()
-            updateUI(data)
-        }
-    }
-}
-
-// ✅ カスタムクラスの場合
-class DataRepository {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    
-    fun loadData() {
-        scope.launch {
-            val data = fetchUserData()
-            processData(data)
-        }
-    }
-    
-    fun cleanup() {
-        scope.cancel() // 明示的にキャンセル
-    }
-}
-```
-
-**GlobalScopeの唯一の適切な使用例**：
-
-アプリ全体のライフサイクルで動き続けるべき処理（非常に稀）：
-
-```kotlin
-// アプリケーションクラスでの初期化処理など
-class MyApplication : Application() {
-    override fun onCreate() {
-        super.onCreate()
-        // これは例外的にOK（アプリの起動時にログを送信など）
-        GlobalScope.launch(Dispatchers.IO) {
-            sendStartupLogs()
-        }
-    }
-}
-```
-
-ただし、これも実際には `applicationScope` など、より適切なスコープを作成して使うべきです。
 
 ## ディスパッチャー：「どこで」実行するかを制御
 
@@ -568,6 +466,7 @@ class MyApplication : Application() {
 ### なぜディスパッチャーが必要？
 
 Androidアプリを例に考えましょう：
+
 - **UIの更新**：必ずメインスレッドで行う必要がある
 - **ネットワーク通信**：メインスレッドでやるとアプリが固まる
 - **重い計算**：メインスレッドでやるとアプリがカクつく
@@ -589,6 +488,7 @@ launch(Dispatchers.Main) {
 ```
 
 **使うべき場面**：
+
 - View（ボタン、テキストなど）の更新
 - Toastやダイアログの表示
 - UIに関わる全ての操作
@@ -607,12 +507,14 @@ suspend fun loadUserFromNetwork(): User {
 ```
 
 **使うべき場面**：
+
 - REST APIの呼び出し
 - ファイルの読み書き
 - データベースのクエリ
 - SharedPreferencesの読み書き
 
 **特徴**：
+
 - スレッドプールで管理されている（最大64個まで）
 - I/O処理は「待ち時間」が多いので、多くのコルーチンで共有できる
 
@@ -630,12 +532,14 @@ suspend fun processLargeData(data: List<Int>): List<Int> {
 ```
 
 **使うべき場面**：
+
 - 大量のデータの並べ替え
 - 画像のリサイズや加工
 - JSONのパース
 - 複雑な計算
 
 **特徴**：
+
 - CPUのコア数と同じだけスレッドを用意（例：4コアなら4スレッド）
 - CPU密集型の処理に最適化されている
 
@@ -688,6 +592,7 @@ fun loadData() = viewModelScope.launch(Dispatchers.Main) {
 ```
 
 **withContextの便利なポイント**：
+
 1. 処理が終わると自動的に元のディスパッチャーに戻る
 2. コードが読みやすい（どこで何が実行されるか明確）
 3. エラーが起きても正しくメインスレッドに戻る
@@ -737,6 +642,7 @@ UIを触る？
 ### シナリオ：ユーザー画面の表示
 
 ユーザー画面を表示するには、以下の3つの情報が必要です：
+
 1. ユーザー情報（1秒かかる）
 2. ユーザーの投稿一覧（1秒かかる）
 3. フォロワー数（1秒かかる）
@@ -767,6 +673,7 @@ suspend fun loadUserScreen(userId: String): UserScreenData {
 ```
 
 **問題点**：
+
 - ユーザー情報を取得するまで、投稿の取得を開始できない
 - 投稿を取得するまで、フォロワー数の取得を開始できない
 - 実際には3つの処理は独立しているので、同時に実行できるはず
@@ -860,6 +767,7 @@ suspend fun loadUserDetailsScreen(userId: String): UserDetailsData = coroutineSc
 ```
 
 **ポイント**：
+
 1. 依存関係がある処理は順番に実行（`withContext`を使う）
 2. 独立した処理は並列実行（`async`を使う）
 3. できるだけ並列実行の部分を多くすると速くなる
@@ -943,12 +851,14 @@ suspend fun comparePerformance() {
    - 「A の結果を使って B を実行する」なら逐次実行が必要
 
 2. **async を使って同時に開始**
+
    ```kotlin
    val task1 = async { doSomething1() }
    val task2 = async { doSomething2() }
    ```
 
 3. **await() で結果を受け取る**
+
    ```kotlin
    val result1 = task1.await()
    val result2 = task2.await()
@@ -1178,6 +1088,7 @@ fun formatUserName(user: User): String {
 #### 判断基準
 
 以下のいずれかに当てはまる場合のみ `suspend` を付けましょう：
+
 - ✅ `delay()` を使う
 - ✅ 他のsuspend関数を呼ぶ
 - ✅ `withContext()` でスレッドを切り替える
