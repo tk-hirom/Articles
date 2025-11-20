@@ -433,68 +433,63 @@ repeat(100) {
 
 このコードの怖いところは、APIは正常にレスポンスを返すため、一見問題がないように見える点です。しかし、バックグラウンドでは100個のコルーチンが動き続け、サーバーのリソースを圧迫し続けているのです。
 
-#### 解決策：CoroutineScopeで寿命を管理
+#### 解決策：適切なScopeで管理する
 
-Spring WebFluxでは、適切なスコープ管理が重要です：
-
-```kotlin
-// ✅ 良い例 - Spring WebFluxの場合
-@Service
-class DataProcessService : CoroutineScope {
-    private val job = SupervisorJob()
-    override val coroutineContext: CoroutineContext = Dispatchers.IO + job
-    
-    suspend fun processData(data: Data): Result {
-        return withContext(coroutineContext) {
-            // この処理はServiceのライフサイクルに紐付いている
-            val processed = heavyProcessing(data)
-            saveToDatabase(processed)
-            Result.success(processed)
-        }
-    }
-    
-    @PreDestroy
-    fun cleanup() {
-        job.cancel() // サービス終了時に全コルーチンをキャンセル
-    }
-}
-```
-
-#### Spring WebFluxでの実践的な使い方
-
-Spring WebFluxでは、コルーチンを使ったサスペンド関数がそのまま使えます：
+GlobalScopeの代わりに、処理のライフサイクルに合わせたScopeを使います。例えば、関数内で完結する処理なら`coroutineScope`を使います：
 
 ```kotlin
-@RestController
-class UserController(private val userService: UserService) {
-    
-    // サスペンド関数として定義するだけ
-    @GetMapping("/users/{id}")
-    suspend fun getUser(@PathVariable id: Long): User {
-        return userService.findById(id) // 自動的に適切なスコープで実行される
+// ✅ 良い例 - coroutineScopeを使う
+suspend fun processDataSafely(data: Data): Result = coroutineScope {
+    // このScopeは関数の実行中だけ有効
+    val processed = async {
+        val fetched = fetchLargeDataSet()
+        processData(fetched)
     }
     
-    @PostMapping("/users")
-    suspend fun createUser(@RequestBody request: CreateUserRequest): User {
-        return userService.create(request)
+    val saved = async {
+        saveResults(processed.await())
     }
+    
+    // すべての処理が完了してから結果を返す
+    Result.success(saved.await())
 }
-
-@Service
-class UserService(private val userRepository: UserRepository) {
-    
-    // Repositoryもサスペンド関数にできる
-    suspend fun findById(id: Long): User {
-        return userRepository.findById(id) ?: throw UserNotFoundException(id)
-    }
-}
+// 関数が終了すると、Scopeも自動的に終了する
 ```
+
+この方法のメリット：
+
+- 関数が終了すれば、自動的にすべてのコルーチンがキャンセルされる
+- 処理が構造化され、リソースリークを防げる
+- 明示的な`cancel()`呼び出しが不要
+
+#### cancel()とは？
+
+ここまで「キャンセル」という言葉が何度か出てきましたが、`cancel()`について説明します。
+
+`cancel()`は、**Scopeに紐づくコルーチンの実行を中断し、リソースをクリーンアップする関数**です。呼び出すと：
+
+- 実行中のコルーチンが停止される
+- 子コルーチンもすべて自動的にキャンセルされる
+- 新しいコルーチンを起動できなくなる
+
+イメージとしては「このScopeはもう使わないので、関連するすべての処理を終了してください」という指示です。
+
+#### cancel()を呼ぶ必要があるのはいつ？
+
+Scopeの種類によって、`cancel()`の扱いが異なります：
+
+| Scopeの種類 | cancel()の必要性 | 理由 |
+|------------|-----------------|------|
+| `coroutineScope` | ❌ **不要** | 関数終了時に自動的にキャンセルされる |
+| `runBlocking` | ❌ **不要** | ブロック終了時に自動的にキャンセルされる |
+| カスタムScope | ✅ **必要** | 明示的に`cancel()`を呼ばないとリソースリークする |
+| `GlobalScope` | ⚠️ **使わない** | そもそも本番コードで使用禁止 |
 
 **覚えておくべきこと**：
 
-- `GlobalScope`：**⚠️ 本番コードでは使用禁止**（理由は後述）
-- Spring WebFlux：サスペンド関数を使えば自動的にリクエストスコープで実行
-- 長時間実行されるバックグラウンドタスク：独自のScopeを作って`@PreDestroy`で適切にクリーンアップ
+- `GlobalScope`：**⚠️ 本番コードでは使用禁止**
+- `coroutineScope`：関数内で完結する処理に使う（自動管理）
+- カスタムScope：長期実行タスクに使うが、終了時は必ず`cancel()`を呼ぶ
 
 #### 主なCoroutineScopeの種類
 
@@ -526,9 +521,30 @@ suspend fun processData() = coroutineScope {
 
 - **使用場面**：suspend関数内で複数の並列処理をまとめたい時
 - **特徴**：すべての子コルーチンが完了するまで関数が終わらない
+- **重要**：**子コルーチンの1つが失敗すると、他の子コルーチンもすべてキャンセルされる**
 - **メリット**：構造化された並行性により、リソースリークを防げる
 
-**3. カスタムScope（独自のライフサイクルを持つスコープ）**
+**3. supervisorScope（子の失敗を分離するスコープ）**
+
+```kotlin
+suspend fun fetchMultipleData() = supervisorScope {
+    val result1 = async { fetchData1() } // 失敗する可能性
+    val result2 = async { fetchData2() } // 失敗しても続行
+    
+    // result1が失敗してもresult2は実行される
+    val data1 = try { result1.await() } catch (e: Exception) { null }
+    val data2 = try { result2.await() } catch (e: Exception) { null }
+    
+    listOfNotNull(data1, data2)
+}
+```
+
+- **使用場面**：複数の独立した処理を並列実行し、一部が失敗しても他を続けたい時
+- **特徴**：子コルーチンの失敗が他の子コルーチンに伝播しない
+- **違い**：`coroutineScope`は1つ失敗すると全体がキャンセル、`supervisorScope`は失敗した子だけキャンセル
+- **メリット**：部分的な失敗を許容できる
+
+**4. カスタムScope（独自のライフサイクルを持つスコープ）**
 
 ```kotlin
 class MyService : CoroutineScope {
@@ -564,9 +580,13 @@ class UserController {
 }
 ```
 
-- **使用場面**：Spring WebFluxでのWeb APIエンドポイント
-- **特徴**：フレームワークが自動的にスコープを管理
+- **使用場面**：Spring WebFluxなどのフレームワークを使う場合
+- **特徴**：フレームワークが自動的にスコープを管理（リクエストスコープなど）
 - **メリット**：明示的なScope管理が不要
+
+:::message
+Spring WebFluxでは、サスペンド関数を使うだけで自動的に適切なスコープで実行されます。詳細は別の記事で解説します。
+:::
 
 ### 3. suspend関数：「一時停止できる関数」の目印
 
@@ -659,15 +679,183 @@ class UserController(
 
 ディスパッチャー（Dispatcher）は「このコルーチンをどのスレッドで実行するか」を決める仕組みです。
 
+### ディスパッチャーとスコープ、ビルダーの関係
+
+これまで学んだ要素がどう組み合わさるか見てみましょう：
+
+```kotlin
+// runBlockingでScopeを作る
+fun main() = runBlocking {  // ← Scope
+    
+    // Scopeの中でビルダーを使ってコルーチンを起動
+    // ビルダーの引数でディスパッチャーを指定
+    launch(Dispatchers.IO) {  // ← ビルダー + ディスパッチャー
+        // IOディスパッチャーで実行される処理
+        fetchDataFromDatabase()
+    }
+    
+    launch(Dispatchers.Default) {  // ← 別のディスパッチャー
+        // Defaultディスパッチャーで実行される処理
+        heavyCalculation()
+    }
+}
+```
+
+**ポイント**：
+
+- **Scope**：コルーチンの寿命を管理
+- **ビルダー**（`launch`、`async`）：コルーチンを起動
+- **ディスパッチャー**：ビルダーの引数として渡し、どのスレッドで実行するかを指定
+
 ### なぜディスパッチャーが必要？
 
-Webアプリケーションを例に考えましょう：
+**結論：処理内容によって「適切なスレッドプール」が違うから**です。
 
-- **CPU集約的な処理**：暗号化、大量のデータ処理など、専用のスレッドプールで実行すべき
-- **I/O処理**：データベースアクセス、外部API呼び出しなど、I/O専用のスレッドプールで実行すべき
-- **軽量な処理**：簡単な計算やデータ変換など、現在のスレッドで実行すれば十分
+例えば、Webアプリケーションでは様々な種類の処理があります：
 
-つまり、処理内容によって「適切なスレッドプール」が違うんです。
+- **CPU集約的な処理**：暗号化、大量のデータ処理など → 専用のスレッドプールで実行すべき
+- **I/O処理**：データベースアクセス、外部API呼び出しなど → I/O専用のスレッドプールで実行すべき
+- **軽量な処理**：簡単な計算やデータ変換など → 現在のスレッドで実行すれば十分
+
+これらを同じスレッドプールで実行すると、CPU処理がI/O待ちのスレッドを占有したり、逆にI/O処理がCPU用のスレッドを無駄に占有したりして、効率が悪くなります。ディスパッチャーを使うことで、それぞれの処理に最適なスレッドプールを選択できます。
+
+:::message
+**ディスパッチャーを指定しない場合**
+明示的にディスパッチャーを指定しない場合、**`Dispatchers.Default`** が使われます。
+
+```kotlin
+// ディスパッチャーを指定しない
+launch {
+    // Dispatchers.Defaultで実行される
+}
+
+// 明示的に指定する
+launch(Dispatchers.IO) {
+    // Dispatchers.IOで実行される
+}
+```
+
+ただし、親のコルーチンがディスパッチャーを持っている場合は、その設定を引き継ぎます。
+:::
+
+### ディスパッチャーを使うメソッド
+
+ディスパッチャーを指定する方法は主に2つあります：
+
+| 方法 | 使い方 | タイミング | 用途 |
+|------|--------|-----------|------|
+| **ビルダー引数** | `launch(Dispatchers.IO) { }` | コルーチン起動時 | 新しいコルーチンを特定のディスパッチャーで実行したい |
+| **withContext** | `withContext(Dispatchers.IO) { }` | コルーチン実行中 | 既存のコルーチン内で一時的にディスパッチャーを切り替えたい |
+
+#### 1. ビルダーの引数として指定
+
+コルーチンを起動する時に、ビルダーの引数としてディスパッチャーを渡します：
+
+```kotlin
+launch(Dispatchers.IO) {
+    // IOディスパッチャーで実行される
+    fetchDataFromDatabase()
+}
+
+async(Dispatchers.Default) {
+    // Defaultディスパッチャーで実行される
+    heavyCalculation()
+}
+```
+
+**特徴**：
+
+- **新しいコルーチンを起動**する
+- 起動時にディスパッチャーを決定
+- 並列実行が可能
+
+#### 2. withContextで途中から切り替え
+
+**`withContext`の重要な特徴：既にあるコルーチンの中で、ディスパッチャーだけを一時的に切り替える**
+
+`launch`は新しいコルーチンを起動しますが、`withContext`は**今動いているコルーチンのまま、実行するスレッドだけを変更**します。
+
+**特徴**：
+
+- **既存のコルーチン内で**ディスパッチャーを切り替える
+- 処理完了まで待機してから次に進む（順次実行）
+- 結果を戻り値として受け取れる
+
+**使用例：コルーチン内でのディスパッチャー切り替え**
+
+以下の例では、コルーチンビルダー（`launch`）でコルーチンを起動し、その中でサービスの`suspend`関数を呼び出しています。
+サービス層の`processUserData`関数内では、`withContext`を使って処理ごとに適切なディスパッチャーに切り替えています：
+
+```kotlin
+// どこかでlaunchを使ってコルーチンを起動
+// （実際のアプリではフレームワークが自動で行う）
+fun main() = runBlocking {
+    launch { // Dispatchers.Defaultで起動
+        val service = UserService()
+        val result = service.processUserData(123)
+        println(result)
+    }
+}
+
+// サービス層：suspend関数内でwithContextを使ってディスパッチャーを切り替える
+class UserService {
+    suspend fun processUserData(userId: Long): String {
+        // Defaultで実行されている状態から、IOに切り替え
+        val userData = withContext(Dispatchers.IO) {
+            database.fetchUser(userId)
+        } // ← IOでの処理が終わったらDefaultに戻る
+        
+        // Defaultに戻った状態から、再びDefaultを明示的に指定
+        val validatedData = withContext(Dispatchers.Default) {
+            validateAndTransform(userData)
+        }
+        
+        // Defaultで実行されている状態から、IOに切り替え
+        withContext(Dispatchers.IO) {
+            database.save(validatedData)
+        } // ← IOでの処理が終わったらDefaultに戻る
+        
+        return "処理完了: ${validatedData.id}"
+    }
+}
+```
+
+**launchでは代替できない理由**
+
+`launch`を使うと、各処理が並列に実行されてしまい、前のステップの結果を待たずに次に進んでしまいます：
+
+```kotlin
+// ❌ これは動かない
+suspend fun processUserDataWrong(userId: Long): String = coroutineScope {
+    launch(Dispatchers.IO) {
+        userData = database.fetchUser(userId)
+    }
+    // userDataがまだ取得されていないのに次に進む
+    
+    launch(Dispatchers.Default) {
+        validatedData = validateAndTransform(userData!!) // NullPointerException!
+    }
+    
+    return "処理完了"
+}
+```
+
+**withContextとlaunchの使い分け**：
+
+| 特徴 | withContext | launch / async |
+|------|-------------|---------------|
+| **実行方法** | 順番に実行（前の処理が完了してから次へ） | 並列実行（すぐに次の処理に進む） |
+| **結果の受け取り** | 処理結果を直接返せる | `launch`: 返せない / `async`: `await()`で取得 |
+| **用途** | データの変換や加工など、順番が重要な処理 | 独立した処理を並列実行したい場合 |
+
+:::message alert
+**並列実行したいときは`withContext`を使わない！**
+
+`withContext`は処理が完了するまで待機する（順次実行）ため、**並列実行には向きません**。
+独立した複数の処理を同時に実行したい場合は、`launch`や`async`を使いましょう。
+:::
+
+`withContext`は処理が完了するまで待ち、結果を返します。処理が終わると、元のディスパッチャーに自動的に戻ります。
 
 ### 4つの主要なディスパッチャー
 
@@ -714,107 +902,11 @@ class UserService(
 
 `Dispatchers.IO`は専用のスレッドプールで管理されており、デフォルトで最大64個までスレッドを使用できます。I/O処理は待ち時間が多いため、1つのスレッドを多くのコルーチンで共有でき、効率的にリソースを活用できます。
 
-#### 3. Dispatchers.Unconfined（特殊用途）
+#### 3. その他のディスパッチャー
 
-呼び出し元のスレッドで開始し、最初のサスペンドポイント後は再開したスレッドで継続します。通常は使用しません。
+他に`Dispatchers.Unconfined`というディスパッチャーも存在しますが、これは**テストコードやライブラリ開発など、非常に特殊なケース**でのみ使用されます。通常のアプリケーション開発では使いません。
 
-#### 4. Dispatchers.Unconfined（特殊用途）
-
-最初は呼び出したスレッドで実行され、一時停止後は再開したスレッドで実行されます。
-
-```kotlin
-launch(Dispatchers.Unconfined) {
-    println("1: ${Thread.currentThread().name}") // 呼び出し元のスレッド
-    delay(100)
-    println("2: ${Thread.currentThread().name}") // 別のスレッド
-}
-```
-
-**注意**：特殊な用途以外では使わないでください。
-
-### ディスパッチャーの切り替え：withContext
-
-`withContext`を使うと、一時的に別のディスパッチャーに切り替えられます。
-
-```kotlin
-@Service
-class OrderService(
-    private val orderRepository: OrderRepository,
-    private val externalApiClient: ExternalApiClient,
-    private val notificationService: NotificationService
-) {
-    suspend fun processOrder(orderId: Long) {
-        // I/O処理でデータ取得
-        val order = withContext(Dispatchers.IO) {
-            orderRepository.findById(orderId)
-        }
-        
-        // CPU集約的な処理で計算
-        val total = withContext(Dispatchers.Default) {
-            calculateComplexTotal(order)
-        }
-        
-        // 再びI/O処理で外部API呼び出し
-        withContext(Dispatchers.IO) {
-            externalApiClient.confirmPayment(order, total)
-        }
-        
-        // I/O処理でデータベース更新
-        withContext(Dispatchers.IO) {
-            orderRepository.updateStatus(orderId, "COMPLETED")
-        }
-        
-        // 非同期で通知を送信（結果を待たない）
-        notificationService.sendOrderConfirmation(orderId)
-    }
-    
-    private fun calculateComplexTotal(order: Order): BigDecimal {
-        // CPU集約的な計算
-        return order.items.map { it.price * it.quantity }
-            .fold(BigDecimal.ZERO) { acc, price -> acc + price }
-    }
-}
-```
-
-`withContext`には3つの便利なポイントがあります。
-
-1. 処理が終わると自動的に元のディスパッチャーに戻る
-2. コードが読みやすい（どこで何が実行されるか明確）
-3. エラーが起きても正しく元のスレッドに戻る
-
-### 実例：複数APIの並列呼び出し
-
-```kotlin
-@RestController
-class DashboardController(private val dashboardService: DashboardService) {
-    
-    @GetMapping("/dashboard")
-    suspend fun getDashboard(): DashboardData {
-        return dashboardService.loadDashboardData()
-    }
-}
-
-@Service
-class DashboardService(
-    private val userApiClient: UserApiClient,
-    private val orderApiClient: OrderApiClient,
-    private val notificationApiClient: NotificationApiClient
-) {
-    suspend fun loadDashboardData(): DashboardData = coroutineScope {
-        // 3つの外部APIを同時に呼び出し
-        val userDeferred = async(Dispatchers.IO) { userApiClient.getUser() }
-        val ordersDeferred = async(Dispatchers.IO) { orderApiClient.getOrders() }
-        val notificationsDeferred = async(Dispatchers.IO) { notificationApiClient.getNotifications() }
-        
-        // 全ての結果を待つ（並列実行なので速い）
-        val user = userDeferred.await()
-        val orders = ordersDeferred.await()
-        val notifications = notificationsDeferred.await()
-        
-        DashboardData(user, orders, notifications)
-    }
-}
-```
+もし「スレッド切り替えコストを極限まで削減したい」「テストで同期的に実行したい」といった特殊なケースに遭遇したら、その時に調べてみてください。
 
 ### ディスパッチャーの選び方フローチャート
 
@@ -826,9 +918,21 @@ class DashboardService(
 └─ No → ディスパッチャー指定不要（現在のスレッドで実行）
 ```
 
+:::message
+**軽い処理ならディスパッチャーを気にしなくてOK**
+
+以下のような処理は、わざわざディスパッチャーを切り替える必要はありません：
+
+- 変数の代入や簡単な計算
+- リストの要素数チェックや簡単なフィルタリング
+- データクラスの変換（単純なマッピング）
+
+ディスパッチャーの切り替え自体にもわずかなコストがあるため、**時間のかかる処理だけ**気にすればOKです。
+:::
+
 ## 実践例：複数のAPI呼び出しを速くする
 
-ここまでの知識を使って、実際によくある「複数の外部APIを呼ぶ」場面を最適化してみましょう。
+ここまでの知識を使って、実際によくある「複数の外部APIを呼ぶ」場面を最適化してみましょう。以降これを「統合API」と呼びます。
 
 ### シナリオ：統合APIエンドポイントの実装
 
@@ -838,45 +942,15 @@ class DashboardService(
 2. 注文サービスから注文履歴（1秒かかる）
 3. ポイントサービスからポイント残高（1秒かかる）
 
-### パターン1：逐次実行（遅い、初心者がやりがち）
+:::message alert
+**よくある間違い：順番に処理してしまう**
 
-```kotlin
-@Service
-class UserProfileService(
-    private val userApiClient: UserApiClient,
-    private val orderApiClient: OrderApiClient,
-    private val pointApiClient: PointApiClient
-) {
-    // ❌ 悪い例：順番に待つので遅い
-    suspend fun getUserProfile(userId: Long): UserProfileData {
-        // 1. ユーザー情報を取得（1秒）
-        val user = withContext(Dispatchers.IO) {
-            userApiClient.getUser(userId)
-        }
-        
-        // 2. 注文履歴を取得（1秒）
-        val orders = withContext(Dispatchers.IO) {
-            orderApiClient.getOrders(userId)
-        }
-        
-        // 3. ポイント残高を取得（1秒）
-        val points = withContext(Dispatchers.IO) {
-            pointApiClient.getPoints(userId)
-        }
-        
-        return UserProfileData(user, orders, points)
-        // 合計：3秒かかる
-    }
-}
-```
+3つの処理を順番に実行すると、合計3秒かかってしまいます。しかし、これらは**互いに独立した処理**なので、同時に実行できるはずです。
 
-**問題点**：
+コルーチンを使えば、これらを並列に実行して**1秒で完了**させることができます！
+:::
 
-- ユーザー情報を取得するまで、注文履歴の取得を開始できない
-- 注文履歴を取得するまで、ポイント残高の取得を開始できない
-- 実際には3つの処理は独立しているので、同時に実行できるはず
-
-### パターン2：並列実行（速い、推奨）
+### 並列実行の実装（推奨）
 
 ```kotlin
 @Service
@@ -927,9 +1001,11 @@ class UserProfileService(
 await()で結果を受け取る（既に完了しているので即座に返る）
 ```
 
-### パターン3：依存関係がある場合
+### 依存関係がある場合の実装
 
 「ユーザー情報を取得してから、そのユーザーの設定に基づいて別の処理を行う」のように、依存関係がある場合はどうするか？
+
+**方法1：withContextを使う**
 
 ```kotlin
 @Service
@@ -938,17 +1014,15 @@ class RecommendationService(
     private val productApiClient: ProductApiClient,
     private val categoryApiClient: CategoryApiClient
 ) {
-    // 依存関係がある場合の処理
     suspend fun getRecommendations(userId: Long): RecommendationData = coroutineScope {
-        // まずユーザー情報を取得（これは待つ必要がある）
+        // ステップ1: ユーザー情報を取得（後続処理で必要なので待つ）
         val user = withContext(Dispatchers.IO) {
             userApiClient.getUser(userId)
         }
         
-        // ユーザー情報から興味のあるカテゴリーを取得
         val favoriteCategories = user.preferences.favoriteCategories
         
-        // ここから並列実行できる処理
+        // ステップ2: ユーザー情報を使った処理を並列実行
         val productsDeferred = async(Dispatchers.IO) {
             productApiClient.getProducts(favoriteCategories)
         }
@@ -957,7 +1031,6 @@ class RecommendationService(
             categoryApiClient.getCategories(favoriteCategories)
         }
         
-        // user.membershipTypeに基づいて処理を分岐
         val premiumContentDeferred = async(Dispatchers.IO) {
             if (user.isPremiumMember) {
                 productApiClient.getPremiumProducts()
@@ -966,7 +1039,6 @@ class RecommendationService(
             }
         }
         
-        // 並列実行した結果を待つ
         RecommendationData(
             user = user,
             products = productsDeferred.await(),
@@ -977,87 +1049,93 @@ class RecommendationService(
 }
 ```
 
-**ポイント**：
+**方法2：asyncとawaitを使う**
 
-1. 依存関係がある処理は順番に実行（`withContext`を使う）
-2. 独立した処理は並列実行（`async`を使う）
-3. できるだけ並列実行の部分を多くすると速くなる
-
-### パターン4：エラーハンドリング付き
+`withContext`の代わりに`async`を使って、すぐに`await()`する方法もあります：
 
 ```kotlin
-@Service
-class UserProfileService(
-    private val userApiClient: UserApiClient,
-    private val orderApiClient: OrderApiClient,
-    private val pointApiClient: PointApiClient
-) {
-    // 実践的なエラーハンドリング
-    suspend fun getUserProfile(userId: Long): Result<UserProfileData> = coroutineScope {
-        try {
-            // 並列実行
-            val userDeferred = async(Dispatchers.IO) { userApiClient.getUser(userId) }
-            val ordersDeferred = async(Dispatchers.IO) { orderApiClient.getOrders(userId) }
-            val pointsDeferred = async(Dispatchers.IO) { 
-                pointApiClient.getPoints(userId) 
-            }
-            
-            // 結果を取得
-            val data = UserProfileData(
-                user = userDeferred.await(),
-                orders = ordersDeferred.await(),
-                points = pointsDeferred.await()
-            )
-            
-            Result.success(data)
-            
-        } catch (e: HttpClientException) {
-            // 外部APIエラー
-            Result.failure(Exception("外部サービスとの通信に失敗しました"))
-        } catch (e: HttpServerException) {
-            // APIサーバーエラー
-            Result.failure(Exception("外部サービスでエラーが発生しました: ${e.message}"))
-        } catch (e: Exception) {
-            // その他のエラー
-            Result.failure(Exception("予期しないエラーが発生しました"))
-        }
-    }
-}
-
-@RestController
-class UserProfileController(private val service: UserProfileService) {
+suspend fun getRecommendations(userId: Long): RecommendationData = coroutineScope {
+    // async + 即座にawait（withContextとほぼ同じ動作）
+    val user = async(Dispatchers.IO) {
+        userApiClient.getUser(userId)
+    }.await()
     
-    @GetMapping("/users/{id}/profile")
-    suspend fun getUserProfile(@PathVariable id: Long): ResponseEntity<UserProfileData> {
-        val result = service.getUserProfile(id)
-        
-        return when {
-            result.isSuccess -> ResponseEntity.ok(result.getOrNull()!!)
-            result.isFailure -> {
-                val error = result.exceptionOrNull()?.message ?: "エラー"
-                ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                    .body(null)
-            }
-            else -> ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(null)
-        }
+    val favoriteCategories = user.preferences.favoriteCategories
+    
+    // 以降は同じ...
+    val productsDeferred = async(Dispatchers.IO) {
+        productApiClient.getProducts(favoriteCategories)
     }
+    // ...
 }
 ```
 
+:::message
+**withContext vs async+即座にawait**
+
+どちらも「処理を実行して結果を待つ」という点では同じ動作です：
+
+- `withContext` → シンプルで読みやすい
+- `async + await` → より明示的だが、即座にawaitするなら冗長
+
+後で`await()`を遅延したい場合は`async`を使い、すぐに結果が必要なら`withContext`を使うのが一般的です。
+:::
+
+**ポイント**：
+
+1. 依存関係がある処理は順番に実行（`withContext`または`async+await`）
+2. 独立した処理は並列実行（`async`を使い、後で`await`）
+3. できるだけ並列実行の部分を多くすると速くなる
+
 ### 並列実行の効果を測定
 
-実際にどれくらい速くなるか、タイマーで測ってみましょう：
+実際にどれくらい速くなるか、タイマーで測ってみましょう
+
+[Kotlin Playground](https://play.kotlinlang.org/#eyJ2ZXJzaW9uIjoiMi4yLjIxIiwicGxhdGZvcm0iOiJqYXZhIiwiYXJncyI6IiIsIm5vbmVNYXJrZXJzIjp0cnVlLCJ0aGVtZSI6ImlkZWEiLCJjb2RlIjoiaW1wb3J0IGtvdGxpbnguY29yb3V0aW5lcy4qXG5pbXBvcnQga290bGluLnN5c3RlbS5tZWFzdXJlVGltZU1pbGxpc1xuXG4vLyDjg4Djg5/jg7zjga5BUEnlkbzjgbPlh7rjgZfvvIjlkIQx56eS44GL44GL44KL77yJXG5zdXNwZW5kIGZ1biBmZXRjaFVzZXIodXNlcklkOiBTdHJpbmcpOiBTdHJpbmcge1xuICAgIGRlbGF5KDEwMDApXG4gICAgcmV0dXJuIFwiVXNlcigkdXNlcklkKVwiXG59XG5cbnN1c3BlbmQgZnVuIGZldGNoT3JkZXJzKHVzZXJJZDogU3RyaW5nKTogU3RyaW5nIHtcbiAgICBkZWxheSgxMDAwKVxuICAgIHJldHVybiBcIk9yZGVycyBmb3IgJHVzZXJJZFwiXG59XG5cbnN1c3BlbmQgZnVuIGZldGNoUG9pbnRzKHVzZXJJZDogU3RyaW5nKTogU3RyaW5nIHtcbiAgICBkZWxheSgxMDAwKVxuICAgIHJldHVybiBcIlBvaW50cyBmb3IgJHVzZXJJZFwiXG59XG5cbi8vIOmAkOasoeWun+ihjOeJiO+8iOmBheOBhO+8iVxuc3VzcGVuZCBmdW4gbG9hZFVzZXJTY3JlZW5TZXF1ZW50aWFsKHVzZXJJZDogU3RyaW5nKTogU3RyaW5nIHtcbiAgICB2YWwgdXNlciA9IGZldGNoVXNlcih1c2VySWQpXG4gICAgdmFsIG9yZGVycyA9IGZldGNoT3JkZXJzKHVzZXJJZClcbiAgICB2YWwgcG9pbnRzID0gZmV0Y2hQb2ludHModXNlcklkKVxuICAgIHJldHVybiBcIiR1c2VyLCAkb3JkZXJzLCAkcG9pbnRzXCJcbn1cblxuLy8g5Lim5YiX5a6f6KGM54mI77yI6YCf44GE77yJXG5zdXNwZW5kIGZ1biBsb2FkVXNlclNjcmVlbih1c2VySWQ6IFN0cmluZyk6IFN0cmluZyA9IGNvcm91dGluZVNjb3BlIHtcbiAgICB2YWwgdXNlckRlZmVycmVkID0gYXN5bmMoRGlzcGF0Y2hlcnMuSU8pIHsgZmV0Y2hVc2VyKHVzZXJJZCkgfVxuICAgIHZhbCBvcmRlcnNEZWZlcnJlZCA9IGFzeW5jKERpc3BhdGNoZXJzLklPKSB7IGZldGNoT3JkZXJzKHVzZXJJZCkgfVxuICAgIHZhbCBwb2ludHNEZWZlcnJlZCA9IGFzeW5jKERpc3BhdGNoZXJzLklPKSB7IGZldGNoUG9pbnRzKHVzZXJJZCkgfVxuICAgIFxuICAgIFwiJHt1c2VyRGVmZXJyZWQuYXdhaXQoKX0sICR7b3JkZXJzRGVmZXJyZWQuYXdhaXQoKX0sICR7cG9pbnRzRGVmZXJyZWQuYXdhaXQoKX1cIlxufVxuXG4vLyDlrp/ooYzjgZfjgabmr5TovINcbnN1c3BlbmQgZnVuIGNvbXBhcmVQZXJmb3JtYW5jZSgpIHtcbiAgICB2YWwgc2VxdWVudGlhbFRpbWUgPSBtZWFzdXJlVGltZU1pbGxpcyB7XG4gICAgICAgIGxvYWRVc2VyU2NyZWVuU2VxdWVudGlhbChcIjEyM1wiKVxuICAgIH1cbiAgICBcbiAgICB2YWwgcGFyYWxsZWxUaW1lID0gbWVhc3VyZVRpbWVNaWxsaXMge1xuICAgICAgICBsb2FkVXNlclNjcmVlbihcIjEyM1wiKVxuICAgIH1cbiAgICBcbiAgICBwcmludGxuKFwi6YCQ5qyh5a6f6KGMOiAke3NlcXVlbnRpYWxUaW1lfW1zXCIpICAvLyDntIQzMDAwbXNcbiAgICBwcmludGxuKFwi5Lim5YiX5a6f6KGMOiAke3BhcmFsbGVsVGltZX1tc1wiKSAgICAvLyDntIQxMDAwbXNcbiAgICBwcmludGxuKFwi5pS55ZaE546HOiAkeyhzZXF1ZW50aWFsVGltZS50b0Zsb2F0KCkgLyBwYXJhbGxlbFRpbWUgKiAxMDApLnRvSW50KCl9JVwiKSAvLyDntIQzMDAlXG59XG5cbmZ1biBtYWluKCkgPSBydW5CbG9ja2luZyB7XG4gICAgY29tcGFyZVBlcmZvcm1hbmNlKClcbn0ifQ==)でそのまま実行できます。
 
 ```kotlin
+import kotlinx.coroutines.*
 import kotlin.system.measureTimeMillis
 
+// ダミーのAPI呼び出し（各1秒かかる）
+suspend fun fetchUser(userId: String): String {
+    delay(1000)
+    return "User($userId)"
+}
+
+suspend fun fetchOrders(userId: String): String {
+    delay(1000)
+    return "Orders for $userId"
+}
+
+suspend fun fetchPoints(userId: String): String {
+    delay(1000)
+    return "Points for $userId"
+}
+
+// 逐次実行版（遅い）
+suspend fun loadUserScreenSequential(userId: String): String {
+    val user = fetchUser(userId)
+    val orders = fetchOrders(userId)
+    val points = fetchPoints(userId)
+    return "$user, $orders, $points"
+}
+
+// 並列実行版（速い）
+suspend fun loadUserScreen(userId: String): String = coroutineScope {
+    val userDeferred = async(Dispatchers.IO){ fetchUser(userId) }
+    val ordersDeferred = async(Dispatchers.IO) { fetchOrders(userId) }
+    val pointsDeferred = async(Dispatchers.IO) { fetchPoints(userId) }
+    
+    "${userDeferred.await()}, ${ordersDeferred.await()}, ${pointsDeferred.await()}"
+}
+
+// 実行して比較
 suspend fun comparePerformance() {
-    // 逐次実行の時間を測定
     val sequentialTime = measureTimeMillis {
         loadUserScreenSequential("123")
     }
     
-    // 並列実行の時間を測定
     val parallelTime = measureTimeMillis {
         loadUserScreen("123")
     }
@@ -1066,193 +1144,40 @@ suspend fun comparePerformance() {
     println("並列実行: ${parallelTime}ms")    // 約1000ms
     println("改善率: ${(sequentialTime.toFloat() / parallelTime * 100).toInt()}%") // 約300%
 }
-```
 
-### まとめ：並列実行のコツ
-
-並列実行を効果的に使うには、4つのポイントを押さえましょう。
-
-**ポイント1：独立した処理を見つける**
-
-まず、処理間の依存関係を確認します。「Aの結果がなくてもBを実行できる」なら並列化可能です。逆に「Aの結果を使ってBを実行する」なら逐次実行が必要です。
-
-**ポイント2：asyncを使って同時に開始**
-
-独立した処理は`async`で同時に開始します：
-
-```kotlin
-val task1 = async { doSomething1() }
-val task2 = async { doSomething2() }
-```
-
-**ポイント3：await()で結果を受け取る**
-
-全てのタスクを開始した後、`await()`で結果を受け取ります：
-
-```kotlin
-val result1 = task1.await()
-val result2 = task2.await()
-```
-
-**ポイント4：エラーハンドリングを忘れずに**
-
-重要な注意点として、1つのタスクがエラーになると、他のタスクも自動的にキャンセルされます。そのため、try-catchで適切にエラーを処理する必要があります。
-
-## エラーハンドリング
-
-```kotlin
-fun loadData() = viewModelScope.launch {
-    try {
-        val data = fetchData()
-        _uiState.value = Success(data)
-    } catch (e: IOException) {
-        _uiState.value = Error("ネットワークエラー")
-    } catch (e: Exception) {
-        _uiState.value = Error("予期しないエラー")
-    }
+fun main() = runBlocking {
+    comparePerformance()
 }
 ```
 
-## 構造化された同時実行性
+実行すると以下のような結果が得られ、並列実行のほうが早いのがわかると思います。
 
-親コルーチンがキャンセルされると、子コルーチンも自動的にキャンセルされます。
-
-```kotlin
-val parentJob = launch {
-    val child1 = launch {
-        repeat(1000) {
-            delay(100)
-            println("Child 1: $it")
-        }
-    }
-    
-    val child2 = launch {
-        repeat(1000) {
-            delay(100)
-            println("Child 2: $it")
-        }
-    }
-}
-
-delay(500)
-parentJob.cancel() // child1とchild2も自動的にキャンセルされる
+``` text
+逐次実行: 3008ms
+並列実行: 1014ms
+改善率: 296%
 ```
 
 ## よくある間違いと落とし穴
 
 コルーチンを学び始めると、誰もが一度は踏んでしまう「よくある間違い」があります。これらは一見動いているように見えても、実は深刻な問題を引き起こす可能性があります。1つずつ見ていきましょう。
 
-### 1. GlobalScopeの使用（最も危険な間違い）
+### 1. GlobalScopeの使用
 
-#### 何が問題なのか？
+:::message alert
+**GlobalScopeは使わない！**
 
-初心者が最もやりがちな間違いが `GlobalScope` の使用です。「とりあえず動けばいいや」と思って使ってしまうと、後で大変なことになります。
+`GlobalScope`は**本番コードでは絶対に使わない**でください。以前のセクションで説明した通り、アプリケーション全体のライフサイクルに紐づいているため：
 
-#### 具体的な問題シナリオ
+- リクエストが終了してもコルーチンが動き続ける
+- リソースリークやメモリリークの原因になる
+- 適切なタイミングでキャンセルできない
 
-想像してください。以下のようなWebアプリケーションの動作を考えてみましょう：
-
-1. クライアントからAPI /users/{id}にリクエストが来る
-2. データ取得処理が始まる（10秒かかる）
-3. 3秒後、クライアントがタイムアウトして接続を切断
-4. リクエストは終了
-5. でも、バックグラウンドではまだデータ取得が続いている...（あと7秒）
-6. データ取得完了！
-7. **レスポンスを返そうとする → エラー！**（接続がもう存在しない）
-
-```kotlin
-@Service
-class UserService {
-    // ❌ 最悪な例：絶対にやってはいけない
-    fun loadUserDataInBackground(userId: Long) {
-        GlobalScope.launch {
-            // この処理は10秒かかる
-            val data = externalApiClient.getUser(userId)
-            
-            // ここで問題発生！
-            // リクエストが終了していても処理が続いている
-            // → リソースの無駄遣い、メモリリーク
-            logger.info("Data loaded: ${data.name}")
-        }
-    }
-}
-```
-
-#### 何が起きているのか？
-
-- `GlobalScope` はアプリケーション全体のライフサイクルに紐づいている
-- つまり、リクエストが終了しても、アプリケーションが終了するまでコルーチンは動き続ける
-- リクエストが終了した後も処理が継続される → **リソースリーク**
-- 不要な処理が蓄積されていく → **パフォーマンス劣化**
-
-#### 正しい方法
-
-適切なスコープを使って、リクエストやサービスのライフサイクルに合わせたコルーチン管理を行います。
-
-**パターン1: suspend関数を使う（推奨）**
-
-```kotlin
-@Service
-class UserService(private val externalApiClient: ExternalApiClient) {
-    
-    // ✅ 良い例：suspend関数を使う
-    suspend fun loadUserData(userId: Long): User {
-        // リクエストがキャンセルされたら、このコルーチンも自動的にキャンセル
-        return withContext(Dispatchers.IO) {
-            externalApiClient.getUser(userId)
-        }
-    }
-}
-
-@RestController
-class UserController(private val userService: UserService) {
-    
-    @GetMapping("/users/{id}")
-    suspend fun getUser(@PathVariable id: Long): User {
-        // リクエストスコープで管理される
-        return try {
-            userService.loadUserData(id)
-        } catch (e: CancellationException) {
-            // リクエストがキャンセルされた時の処理
-            logger.debug("Request was cancelled")
-            throw ResponseStatusException(HttpStatus.REQUEST_TIMEOUT)
-        }
-    }
-}
-```
-
-**パターン2: サービス専用のCoroutineScopeを作成する場合**
-
-```kotlin
-@Service
-class BackgroundJobService : DisposableBean {
-    // サービス専用のスコープ
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    
-    fun processInBackground(userId: Long) {
-        serviceScope.launch {
-            try {
-                // サービスが破棄されたら、このコルーチンも自動的にキャンセル
-                val data = externalApiClient.getUser(userId)
-                logger.info("Processed: ${data.name}")
-            } catch (e: CancellationException) {
-                logger.debug("Service scope was cancelled")
-            }
-        }
-    }
-    
-    // サービス終了時にすべてのコルーチンをキャンセル
-    override fun destroy() {
-        serviceScope.cancel()
-    }
-}
-```
-
-#### なぜこれで問題が解決する？
-
-- suspend関数は呼び出し元のスコープに紐づいている
-- リクエストが終了すると、自動的にコルーチンもキャンセルされる
-- 不要な処理は即座に止まる → リソース節約、メモリリーク防止
+**正しい方法**：
+- `suspend`関数を使う（フレームワークが自動管理）
+- 適切なスコープ（`coroutineScope`、`supervisorScope`）を使う
+- 独自のスコープが必要な場合は、ライフサイクルを明示的に管理する
+:::
 
 ### 2. suspend関数の誤用：suspendを付ければいいと思っている
 
