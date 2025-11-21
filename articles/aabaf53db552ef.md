@@ -342,6 +342,32 @@ scope.launch { // 親コルーチン
 
 Scopeを適切に使うことで、コルーチンが不要になったときに自動的にクリーンアップされます。これにより、メモリリークやCPUの無駄遣いを防げます。
 
+#### コルーチンとコルーチンスコープの入れ子構造
+
+コルーチンの中でコルーチンスコープを作ることができます：
+
+```kotlin
+someScope.launch { // ← コルーチンAを起動
+    // コルーチンAの中
+    
+    coroutineScope { // ← 新しいスコープを作る（コルーチンAは継続）
+        // まだコルーチンAの中で実行されている
+        async { } // 子コルーチンB
+        async { } // 子コルーチンC
+    } // すべての子の完了を待つ
+    
+    // コルーチンAに戻る
+}
+```
+
+入れ子構造のポイント：
+
+- **新しいコルーチンを作るもの**：`launch`、`async`
+- **新しいスコープを作るだけ**：`coroutineScope`、`supervisorScope`（親コルーチンをそのまま使う）
+- **ディスパッチャーを切り替えるだけ**：`withContext`（親コルーチンをそのまま使う）
+
+これにより、親コルーチンの中で子コルーチンたちをグループ化して管理できます。
+
 では、適切にScopeを切らないとどんな問題が起こるのでしょうか？次のセクションで具体例を見てみましょう。
 
 #### 適切にScopeを切らないとどうなるか？
@@ -857,6 +883,164 @@ suspend fun processUserDataWrong(userId: Long): String = coroutineScope {
 
 `withContext`は処理が完了するまで待ち、結果を返します。処理が終わると、元のディスパッチャーに自動的に戻ります。
 
+:::message
+**Spring MVCとSpring WebFluxでのwithContext使用の違い**
+
+Springでコルーチンを使う場合、MVCとWebFluxでは推奨されるコーディングスタイルが異なります。
+
+### Spring MVC：ブロッキングAPIを使う従来型アプローチ
+
+Spring MVCでコルーチンを使う場合、既存の同期的なライブラリ（RestTemplate、JdbcTemplateなど）をそのまま使うことが多いです。これらはスレッドをブロックするため、`withContext(Dispatchers.IO)`でI/O専用スレッドプールに切り替える必要があります。
+
+```kotlin
+@RestController
+class UserController(
+    private val restTemplate: RestTemplate,
+    private val jdbcTemplate: JdbcTemplate
+) {
+    @GetMapping("/users/{id}")
+    suspend fun getUser(@PathVariable id: Long): User {
+        // ブロッキングAPIなので、Dispatchers.IOが必要
+        return withContext(Dispatchers.IO) {
+            restTemplate.getForObject("/api/users/$id", User::class.java)!!
+        }
+    }
+    
+    @GetMapping("/users/{id}/orders")
+    suspend fun getUserOrders(@PathVariable id: Long): List<Order> = coroutineScope {
+        // 複数のブロッキングAPIを並列実行
+        val userDeferred = async(Dispatchers.IO) {
+            jdbcTemplate.queryForObject(
+                "SELECT * FROM users WHERE id = ?",
+                UserRowMapper(),
+                id
+            )!!
+        }
+        val ordersDeferred = async(Dispatchers.IO) {
+            jdbcTemplate.query(
+                "SELECT * FROM orders WHERE user_id = ?",
+                OrderRowMapper(),
+                id
+            )
+        }
+        
+        ordersDeferred.await()
+    }
+}
+```
+
+### Spring WebFlux：リアクティブAPIを使うノンブロッキングアプローチ
+
+Spring WebFluxでは、WebClientやR2DBCなどのリアクティブライブラリを使用します。これらは既に`suspend`関数として提供されており、内部でノンブロッキングに実装されているため、`withContext(Dispatchers.IO)`は不要です。
+
+Spring公式ドキュメントの[Coroutinesセクション](https://docs.spring.io/spring-framework/reference/languages/kotlin/coroutines.html)でも、以下のように`Dispatchers.IO`を指定せずに実装されています：
+
+**順次実行の例：**
+
+```kotlin
+@RestController
+class SequentialController(
+    private val webClient: WebClient
+) {
+    @GetMapping("/sequential")
+    suspend fun sequential(): List<Banner> {
+        // 順次実行：ディスパッチャー指定なし
+        val banner1 = webClient.get()
+            .uri("/suspend")
+            .accept(MediaType.APPLICATION_JSON)
+            .awaitExchange()
+            .awaitBody<Banner>()
+        
+        val banner2 = webClient.get()
+            .uri("/suspend")
+            .accept(MediaType.APPLICATION_JSON)
+            .awaitExchange()
+            .awaitBody<Banner>()
+        
+        return listOf(banner1, banner2)
+    }
+}
+```
+
+**並列実行の例：**
+
+```kotlin
+@RestController
+class ParallelController(
+    private val webClient: WebClient
+) {
+    @GetMapping("/parallel")
+    suspend fun parallel(): List<Banner> = coroutineScope {
+        // 並列実行：async使用、ディスパッチャー指定なし
+        val deferredBanner1 = async {
+            webClient.get()
+                .uri("/suspend")
+                .accept(MediaType.APPLICATION_JSON)
+                .awaitExchange()
+                .awaitBody<Banner>()
+        }
+        
+        val deferredBanner2 = async {
+            webClient.get()
+                .uri("/suspend")
+                .accept(MediaType.APPLICATION_JSON)
+                .awaitExchange()
+                .awaitBody<Banner>()
+        }
+        
+        listOf(deferredBanner1.await(), deferredBanner2.await())
+    }
+}
+```
+
+### なぜWebFluxではディスパッチャー指定が不要なのか？
+
+- `awaitBody()`や`awaitExchange()`は**suspend関数**として実装されている
+- 内部でReactor（リアクティブライブラリ）を使用し、I/O処理が既にノンブロッキング
+- スレッドをブロックせず、I/O完了を待つ間にスレッドを他の処理に使える
+- つまり、**I/O処理でスレッドプールを切り替える必要がない**
+
+### ただし注意：CPU集約的な処理は別
+
+I/O処理はノンブロッキングですが、**取得したデータに対してCPU集約的な処理を行う場合は`withContext(Dispatchers.Default)`が必要**です：
+
+```kotlin
+@RestController
+class DataProcessingController(
+    private val webClient: WebClient
+) {
+    @GetMapping("/process")
+    suspend fun fetchAndProcess(): ProcessedData {
+        // I/O処理：ノンブロッキング、ディスパッチャー不要
+        val rawData = webClient.get()
+            .uri("/large-data")
+            .retrieve()
+            .awaitBody<RawData>()
+        
+        // CPU集約的な処理：Dispatchers.Defaultに切り替え
+        return withContext(Dispatchers.Default) {
+            // 大量データの変換、集計、暗号化など
+            processHeavyComputation(rawData)
+        }
+    }
+}
+```
+
+### まとめ
+
+| フレームワーク | 使用するライブラリ | I/O処理のディスパッチャー | CPU処理のディスパッチャー |
+|-----------|------------|----------------|----------------|
+| **Spring MVC** | RestTemplate、JDBC | `withContext(Dispatchers.IO)` 必要 | `withContext(Dispatchers.Default)` 必要 |
+| **Spring WebFlux** | WebClient、R2DBC | ディスパッチャー指定不要 | `withContext(Dispatchers.Default)` 必要 |
+
+**判断のポイント：**
+
+- MVCで**ブロッキングAPI**（RestTemplate、JDBC等）を使う場合 → `withContext(Dispatchers.IO)`が必要
+- WebFluxで**リアクティブAPI**（WebClient、R2DBC等）を使う場合 → I/O処理にディスパッチャー指定は不要
+- **どちらの場合でも**、CPU集約的な処理には`withContext(Dispatchers.Default)`が必要
+
+:::
+
 ### 4つの主要なディスパッチャー
 
 #### 1. Dispatchers.Default（CPU集約的な処理用）
@@ -1005,33 +1189,41 @@ await()で結果を受け取る（既に完了しているので即座に返る�
 
 「ユーザー情報を取得してから、そのユーザーの設定に基づいて別の処理を行う」のように、依存関係がある場合はどうするか？
 
-**方法1：withContextを使う**
+:::message
+**前提：APIクライアントが既にsuspend関数の場合**
+
+この例では、APIクライアントのメソッドが既に`suspend fun getUser(): User`のように定義されていることを想定しています。
+このような場合、APIクライアント側で既に適切なスレッド管理がされているため、呼び出し側で`withContext(Dispatchers.IO)`を使う必要はありません。
+
+もしAPIクライアントが同期的（ブロッキング）な実装の場合は、前述の「Spring MVCとWebFluxの違い」を参照してください。
+:::
+
+**実装例：suspend関数を順次・並列実行**
 
 ```kotlin
 @Service
 class RecommendationService(
-    private val userApiClient: UserApiClient,
+    private val userApiClient: UserApiClient, // suspend関数を提供
     private val productApiClient: ProductApiClient,
     private val categoryApiClient: CategoryApiClient
 ) {
     suspend fun getRecommendations(userId: Long): RecommendationData = coroutineScope {
         // ステップ1: ユーザー情報を取得（後続処理で必要なので待つ）
-        val user = withContext(Dispatchers.IO) {
-            userApiClient.getUser(userId)
-        }
+        // APIクライアントが既にsuspend関数なので、withContextは不要
+        val user = userApiClient.getUser(userId)
         
         val favoriteCategories = user.preferences.favoriteCategories
         
         // ステップ2: ユーザー情報を使った処理を並列実行
-        val productsDeferred = async(Dispatchers.IO) {
+        val productsDeferred = async {
             productApiClient.getProducts(favoriteCategories)
         }
         
-        val categoriesDeferred = async(Dispatchers.IO) {
+        val categoriesDeferred = async {
             categoryApiClient.getCategories(favoriteCategories)
         }
         
-        val premiumContentDeferred = async(Dispatchers.IO) {
+        val premiumContentDeferred = async {
             if (user.isPremiumMember) {
                 productApiClient.getPremiumProducts()
             } else {
@@ -1049,41 +1241,35 @@ class RecommendationService(
 }
 ```
 
-**方法2：asyncとawaitを使う**
+**このコードの入れ子構造**：
 
-`withContext`の代わりに`async`を使って、すぐに`await()`する方法もあります：
+```text
+someScope（呼び出し元のスコープ）
+  └─ launch（コルーチンA） ← 新しいコルーチンを起動
+       └─ getRecommendations()
+            └─ coroutineScope { } ← 新しいスコープを作る（コルーチンAは継続）
+                 ├─ userApiClient.getUser() ← コルーチンAで実行（suspend関数）
+                 ├─ async { } ← 子コルーチンBを起動
+                 ├─ async { } ← 子コルーチンCを起動
+                 └─ async { } ← 子コルーチンDを起動
+```
+
+- **新しいコルーチンを作るもの**：`launch`、`async`
+- **新しいスコープを作るだけ**：`coroutineScope`（親コルーチンをそのまま使う）
+- **suspend関数の呼び出し**：現在のコルーチンで実行（新しいコルーチンやスレッド切り替えは発生しない）
+
+呼び出し側：
 
 ```kotlin
-suspend fun getRecommendations(userId: Long): RecommendationData = coroutineScope {
-    // async + 即座にawait（withContextとほぼ同じ動作）
-    val user = async(Dispatchers.IO) {
-        userApiClient.getUser(userId)
-    }.await()
-    
-    val favoriteCategories = user.preferences.favoriteCategories
-    
-    // 以降は同じ...
-    val productsDeferred = async(Dispatchers.IO) {
-        productApiClient.getProducts(favoriteCategories)
-    }
+someScope.launch {
+    val recommendations = recommendationService.getRecommendations(userId)
     // ...
 }
 ```
 
-:::message
-**withContext vs async+即座にawait**
-
-どちらも「処理を実行して結果を待つ」という点では同じ動作です：
-
-- `withContext` → シンプルで読みやすい
-- `async + await` → より明示的だが、即座にawaitするなら冗長
-
-後で`await()`を遅延したい場合は`async`を使い、すぐに結果が必要なら`withContext`を使うのが一般的です。
-:::
-
 **ポイント**：
 
-1. 依存関係がある処理は順番に実行（`withContext`または`async+await`）
+1. 依存関係がある処理は順番に実行（suspend関数を直接呼び出す）
 2. 独立した処理は並列実行（`async`を使い、後で`await`）
 3. できるだけ並列実行の部分を多くすると速くなる
 
@@ -1174,6 +1360,7 @@ fun main() = runBlocking {
 - 適切なタイミングでキャンセルできない
 
 **正しい方法**：
+
 - `suspend`関数を使う（フレームワークが自動管理）
 - 適切なスコープ（`coroutineScope`、`supervisorScope`）を使う
 - 独自のスコープが必要な場合は、ライフサイクルを明示的に管理する
@@ -1209,40 +1396,7 @@ suspend fun formatText(text: String): String {
 3. **誤解を招く**: コードを読む人が「これは時間のかかる処理だな」と誤解する
 4. **パフォーマンス**: わずかながらオーバーヘッドがある
 
-#### 正しい使い方
-
 `suspend` を付けるべきなのは、**実際に一時停止する処理がある場合のみ**です。
-
-```kotlin
-// ✅ 良い例：実際に一時停止する処理
-suspend fun fetchFromNetwork(): User {
-    // withContextで別スレッドに切り替える（一時停止ポイント）
-    return withContext(Dispatchers.IO) {
-        apiService.getUser() // ネットワーク通信（一時停止ポイント）
-    }
-}
-
-suspend fun saveToDatabase(user: User) {
-    // データベース操作（一時停止ポイント）
-    withContext(Dispatchers.IO) {
-        database.insertUser(user)
-    }
-}
-
-suspend fun processWithDelay() {
-    delay(1000) // 明示的な一時停止
-    println("1秒後に実行")
-}
-
-// ✅ suspendが不要な例：普通の関数でOK
-fun calculate(a: Int, b: Int): Int {
-    return a + b // 瞬時に終わるのでsuspendは不要
-}
-
-fun formatUserName(user: User): String {
-    return "${user.firstName} ${user.lastName}"
-}
-```
 
 #### 判断基準
 
