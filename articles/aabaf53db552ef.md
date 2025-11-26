@@ -2,21 +2,77 @@
 title: "Kotlin Coroutineを噛み砕いて理解する"
 emoji: "🚀"
 type: "tech" # tech: 技術記事 / idea: アイデア
-topics: ["kotlin", "coroutine", "android"]
+topics: ["kotlin", "coroutine", "spring"]
 published: false
 ---
 
 ## はじめに
 
-現在、遊撃的にWebFluxの刷新しており、Kotlin Coroutineを活用しています。Coroutineを使えば同期的に書けるコードでありながら、並行処理のメリットを享受できる点に大きな魅力を感じていました。しかし、実際に使っていく中で「雰囲気で触っているだけで、本質を理解できていないのでは？」という疑問が湧いてきました。そこで、公式ドキュメントや関連資料を改めてさらい、基礎から学び直すことにしました。
+現在、遊撃的にWebFluxの刷新しており、Kotlin Coroutineを活用しています。
 
-この記事では、Kotlinのコルーチン（Coroutine）の基本概念を、**Kotlinでバックエンド開発をする方**を想定読者として、実践的な例を使って噛み砕いて説明します。Spring WebFluxなどのフレームワークを使っている方、これから使おうと考えている方の理解の助けになれば幸いです。
+もともとCoroutineは使っていたのですが、MVCで使用していたので非同期処理を同期的に書くための文法としてのみ利用されており、並行処理にはなっていなかったです。
+
+しかし、実際に使っていく中で「雰囲気で触っているだけで、本質を理解できていないのでは？」という疑問が湧いてきました。そこで、公式ドキュメントや関連資料を改めてさらい、基礎から学び直すことにしました。
+
+## 想定読者
+
+- Kotlinをバックエンド開発で使用している
+- コルーチンを雰囲気で使っている
+- Spring MVCは触ってことがあるが、WebFluxはない
+- あるけど、コルーチンがどのようにそれぞれのライブラリで振る舞うのかよくわかっていない
+- Kotlinのドキュメント何書いてあるかよくわからん
+
+といった方を想定して書いています。
+
+## 前提：Spring MVCでのコルーチンは並行処理ではない
+
+この記事を読む前に、重要な前提を理解しておく必要があります。
+
+**Spring MVCでコルーチンを使っても、それは並行処理にはなりません。**
+
+冒頭でも触れましたが、Spring MVCでコルーチン（`suspend`関数）を使用した場合、それは「非同期処理を同期的な記法で書けるようにする」という文法的なメリットを享受しているだけです。内部的には、コルーチンが中断するたびにスレッドがブロックされ、通常のブロッキングI/Oと同じ挙動になります。
+
+```kotlin
+// Spring MVCでの例
+@RestController
+class UserController(private val userRepository: UserRepository) {
+    
+    @GetMapping("/users/{id}")
+    suspend fun getUser(@PathVariable id: Long): User {
+        // suspend関数だが、MVCではスレッドがブロックされる
+        return userRepository.findById(id) // スレッドが待機状態になる
+    }
+}
+```
+
+このコードは `suspend` を使っていますが、**実際にはスレッドをブロックしています**。`findById()` が完了するまで、リクエストを処理しているスレッドは解放されません。
+
+一方、**Spring WebFluxでコルーチンを使う場合は、真の非同期・ノンブロッキング処理**になります。I/O待機中にスレッドが解放され、他のリクエスト処理に使えるようになります。
+
+```kotlin
+// Spring WebFluxでの例
+@RestController
+class UserController(private val userRepository: UserRepository) {
+    
+    @GetMapping("/users/{id}")
+    suspend fun getUser(@PathVariable id: Long): User {
+        // WebFluxではスレッドが解放される（ノンブロッキング）
+        return userRepository.findById(id) // スレッドは他の処理に使われる
+    }
+}
+```
+
+この違いは、Spring MVCがブロッキングI/Oを前提としたアーキテクチャであるのに対し、Spring WebFluxはノンブロッキングI/Oを前提としたリアクティブアーキテクチャである点に起因します。
+
+したがって、この記事で説明するコルーチンの並行処理の仕組みやメリットは、**Spring WebFluxや他のノンブロッキング環境で使用する場合にのみ完全に発揮されます**。Spring MVCで使う場合は、コードの可読性向上という側面でのメリットに留まることを理解してください。
+
+同じ実装をした際の、MVCとWebFluxの振る舞いの違いについて後述するのでそちらで理解を深められるかと思います。
 
 ## コルーチンの概要と必要性
 
 ### 同期的なコードの問題
 
-まず、最もシンプルな同期的なコードから見てみましょう。WebAPIでデータベースからユーザー情報を取得する処理を考えてみます：
+まず、最もシンプルな同期的なコードから見てみましょう。WebAPIでデータベースからユーザー情報を取得する処理を考えてみます。
 
 ```kotlin
 @RestController
@@ -38,7 +94,7 @@ Tomcatのデフォルト設定では200スレッドしかないため、200件�
 
 ### 従来のアプローチ：スレッドによる非同期処理
 
-この問題に対する伝統的な解決策は、スレッドプールを使って処理を別のスレッドで実行することでした：
+この問題に対する伝統的な解決策は、スレッドプールを使って処理を別のスレッドで実行することでした。
 
 ```kotlin
 @RestController
@@ -59,19 +115,21 @@ class UserController(
 
 まず、**リソースの制約**です。スレッドは非常に「重い」リソースで、1つあたり約1MB〜2MBのメモリを消費します。そのため、実用的には数百個〜数千個程度しか作成できません。また、スレッド間の切り替え（コンテキストスイッチ）はCPUに負荷をかけ、大量のスレッドがあるとパフォーマンスが急激に悪化します。
 
-さらに、**開発の複雑さ**も問題です。スレッド間の通信は煩雑で、バックエンドでもUIスレッド（メインスレッド）への切り戻しを明示的に行う必要があります。加えて、エラーハンドリングやキャンセル処理が複雑になりがちで、デッドロックやレースコンディションといったバグを生みやすくなります。
+ > さらに、**開発の複雑さ**も問題です。スレッド間の通信は煩雑で、バックエンドでもUIスレッド（メインスレッド）への切り戻しを明示的に行う必要があります。加えて、エラーハンドリングやキャンセル処理が複雑になりがちで、デッドロックやレースコンディションといったバグを生みやすくなります。
+
+ 書き込みがある場合は、上記も問題になってくるでしょう。ただ、自分はここに関しては実務で直面したことはないのでAIの受け売りの引用だけ書いておきます。
 
 ### スレッドの限界：スケーラビリティの問題
 
-例えば、1万件の同時接続を処理する必要がある場合（いわゆるC10K問題）を考えてみましょう。各接続に1つのスレッドを割り当てるアプローチでは：
+例えば、1万件の同時接続を処理する必要がある場合（いわゆるC10K問題）を考えてみましょう。各接続に1つのスレッドを割り当てるアプローチでは。
 
 - **メモリ消費**: 10,000スレッド × 2MB = 約20GBのメモリが必要
 - **コンテキストスイッチのオーバーヘッド**: 大量のスレッド間の切り替えでCPUリソースが枯渇
 - **スケーラビリティの限界**: 接続数が増えるほどパフォーマンスが急激に悪化
 
-この問題に対処するため、従来はイベントループやノンブロッキングI/Oといった複雑なアーキテクチャパターンが必要でした。しかし、これらのアプローチはコードを複雑にし、理解や保守を困難にします。
+といった問題に直面します。
 
-これらの問題に対処できるのがコルーチンです。
+Spring MVCだとがまさにスレッドによる並列処理をするものなので、この問題に直面してしまいます。私がWebFlux乗り換えをしようと思ったきっかけでもあります。
 
 ### コルーチンによる軽量な非同期処理
 
@@ -124,28 +182,11 @@ fun main() = runBlocking {
 
 `launch`には3つの重要な特徴があります。まず、戻り値として`Job`（処理の管理チケットのようなもの）を返します。次に、処理の結果を返さない（返せない）設計になっています。そのため、「ログ出力」「データ保存」など、結果が不要な処理に最適です。
 
-戻り値の`Job`を使うと、起動したコルーチンを制御できます：
-
-```kotlin
-val job = launch {
-    repeat(10) {
-        println("処理中... $it")
-        delay(500)
-    }
-}
-
-// 他の処理...
-
-job.cancel() // 処理をキャンセル
-// または
-job.join() // 処理の完了を待つ
-// または
-job.cancelAndJoin() // キャンセルして完了を待つ
-```
+戻り値は`Job`です。これについては後述します。
 
 #### async / await：「起動して、結果を受け取りたい」
 
-`async`は「実行して、後で結果が欲しい！」という時に使います。
+`async`は「実行して、後で結果が欲しい！」という時に使います。戻り値は`Job`を継承した`Deferred`です。
 
 ```kotlin
 fun main() = runBlocking {
@@ -167,7 +208,7 @@ fun main() = runBlocking {
 }
 ```
 
-**出力**：
+**出力**。
 
 ```
 計算開始
@@ -176,7 +217,7 @@ fun main() = runBlocking {
 計算結果: 42
 ```
 
-**async/awaitの使い分け**：
+**async/awaitの使い分け**。
 
 ```kotlin
 // ❌ こうすると遅い（逐次実行）
@@ -197,15 +238,17 @@ suspend fun fetchDataFast(): Pair<User, List<Post>> = coroutineScope {
     val user = userDeferred.await()
     val posts = postsDeferred.await()
     
-    return@coroutineScope user to posts
-    // 合計1秒（並列実行されるから）
+    return@coroutineScope user to posts // 合計1秒（並列実行されるから）
 }
 ```
 
-**レストランの例で理解する**：
+:::details return@coroutineScopeとは？
+`return@coroutineScope` は「`coroutineScope`ブロックから値を返す」という意味です。
 
-- `launch`: 「料理を作っておいて（結果は要らない）」
-- `async/await`: 「料理を作っておいて、できたら持ってきて（結果が欲しい）」
+通常の`return`だと外側の関数から抜けてしまうため、`@coroutineScope`を付けてどこから返すかを明示する必要があります。これを**ラベル付きreturn**と呼びます。
+
+Kotlinでは、ラムダ式やブロック内から特定のスコープに値を返したい場合に、この構文を使用します。
+:::
 
 #### runBlocking：「普通の世界とコルーチンの世界を繋ぐ」
 
@@ -274,7 +317,7 @@ fun testSuspendFunction() = runBlocking {
 
 CoroutineScopeは、**コルーチンの寿命を管理する枠組み**です。
 
-前のセクションで学んだ`launch`や`async`といったコルーチンビルダーは、実は必ず「どこかのScope」の中で実行する必要があります。例えば：
+前のセクションで学んだ`launch`や`async`といったコルーチンビルダーは、実は必ず「どこかのScope」の中で実行する必要があります。例えば。
 
 ```kotlin
 // ❌ これはエラー！Scopeがない
@@ -295,7 +338,7 @@ fun someFunction() = runBlocking { // runBlockingがScopeを提供
 つまり、**`launch`や`async`といったコルーチンビルダーは、必ず「どこかのScope」の中でしか使えない**という関係になっています。
 
 :::details launchはCoroutineScopeの拡張関数
-Kotlinの機能で、既存のクラスを変更せずに新しい関数を追加できる仕組みです。例えば：
+Kotlinの機能で、既存のクラスを変更せずに新しい関数を追加できる仕組みです。例えば。
 
 ```kotlin
 // String型に新しい関数を追加する例
@@ -308,18 +351,18 @@ fun String.addPrefix(): String = "PREFIX_$this"
 `launch`は`CoroutineScope`の拡張関数として定義されているため、実際には`CoroutineScope.launch()`のように「Scopeに対して」呼び出す形になります。そのため、Scopeがない場所では`launch`を呼び出せません。
 :::
 
-Scopeには次のような役割があります：
+Scopeには次のような役割があります。
 
 **役割1：コルーチンの実行範囲を定める**
 
-Scopeは「このコルーチンはどの範囲で実行されるべきか」を定義します。例えば：
+Scopeは「このコルーチンはどの範囲で実行されるべきか」を定義します。例えば。
 
 - リクエストのスコープ：リクエスト処理が終わったら終了
 - サービスのスコープ：アプリケーションが動いている間は有効
 
 **役割2：親子関係による自動管理**
 
-Scopeの中で起動されたコルーチンは、親子関係を持ちます：
+Scopeの中で起動されたコルーチンは、親子関係を持ちます。
 
 ```kotlin
 scope.launch { // 親コルーチン
@@ -332,7 +375,7 @@ scope.launch { // 親コルーチン
 }
 ```
 
-この親子関係により、次のような自動管理が行われます：
+この親子関係により、次のような自動管理が行われます。
 
 - 親がキャンセルされると、子も自動的にキャンセルされる
 - 子のどれかが例外を投げると、親に伝播する
@@ -344,7 +387,7 @@ Scopeを適切に使うことで、コルーチンが不要になったときに
 
 #### コルーチンとコルーチンスコープの入れ子構造
 
-コルーチンの中でコルーチンスコープを作ることができます：
+コルーチンの中でコルーチンスコープを作ることができます。
 
 ```kotlin
 someScope.launch { // ← コルーチンAを起動
@@ -360,7 +403,7 @@ someScope.launch { // ← コルーチンAを起動
 }
 ```
 
-入れ子構造のポイント：
+入れ子構造のポイント。
 
 - **新しいコルーチンを作るもの**：`launch`、`async`
 - **新しいスコープを作るだけ**：`coroutineScope`、`supervisorScope`（親コルーチンをそのまま使う）
@@ -368,158 +411,9 @@ someScope.launch { // ← コルーチンAを起動
 
 これにより、親コルーチンの中で子コルーチンたちをグループ化して管理できます。
 
-では、適切にScopeを切らないとどんな問題が起こるのでしょうか？次のセクションで具体例を見てみましょう。
-
-#### 適切にScopeを切らないとどうなるか？
-
-例えば、WebAPIでバックグラウンドで大量のデータ処理を開始したとします：
-
-```kotlin
-// ❌ 悪い例
-@RestController
-class DataProcessController {
-    
-    @PostMapping("/process")
-    fun startProcessing(): String {
-        GlobalScope.launch {
-            val data = fetchLargeDataSet() // 10分かかる
-            processData(data) // データを処理
-            saveResults(data) // 結果を保存
-        }
-        return "Processing started"
-    }
-}
-```
-
-**このコードは何をしているのか？**
-
-このコードで使われている`GlobalScope.launch { ... }`という構文について説明します。
-
-- `launch`：前述したコルーチンビルダーで、コルーチンを起動して`Job`を返す関数です
-- `GlobalScope`：「アプリケーション全体」というスコープ（実行範囲）を表します
-- `{ }`（波括弧）の中：バックグラウンドで非同期に実行される処理
-
-つまり、`GlobalScope.launch { ここの処理 }`は「アプリケーション全体の寿命で、バックグラウンド処理を実行する」という意味です。前述の通り、`launch`は結果を返さず、起動したコルーチンの管理用の`Job`を返します。
-
-このAPIエンドポイントの動作の流れ：
-
-1. クライアントから`/process`にPOSTリクエストが届く
-2. `GlobalScope.launch`でバックグラウンド処理を起動（コルーチンを開始）
-3. **すぐに**「Processing started」というレスポンスをクライアントに返す（処理の完了を待たない）
-4. その間、バックグラウンドでは波括弧内の処理（データ取得→処理→保存）が10分かけて実行される
-
-一見すると「重い処理をバックグラウンドで実行しているから問題ない」ように見えますが、実はこのコードには深刻な問題が隠れています。特に`GlobalScope`という「アプリケーション全体のスコープ」を使っている点が致命的です。
-
-**何が問題なのか？**
-
-このコードには深刻な問題があります。特に問題になるのは、アプリケーションをシャットダウンしようとしたときです。実際の運用シーンを想定して、タイムラインで何が起こるか見てみましょう：
-
-```text
-時刻 0:00 - クライアントがAPIリクエストを送信
-時刻 0:01 - サーバーがリクエストを受け取り、GlobalScope.launchで処理を開始
-時刻 0:02 - クライアントに "Processing started" というレスポンスを返す
-時刻 0:05 - データ取得処理が進行中...（fetchLargeDataSet実行中）
-時刻 0:10 - 運用チームがアプリケーションの再起動を決定（デプロイのため）
-時刻 0:11 - アプリケーションのシャットダウンシグナルが送られる
-```
-
-このタイミングで、4つの深刻な問題が同時に発生します：
-
-**問題1：コルーチンがまだ実行中**
-
-データ取得処理は10分かかる予定で、まだ8分残っています。`GlobalScope`で起動されたコルーチンはアプリケーション全体のライフサイクルに紐づいているため、シャットダウンシグナルを受け取っても自動的にはキャンセルされません。
-
-**問題2：アプリケーションが終了できない**
-
-Springなどのフレームワークは、実行中のタスクがある場合、終了を待ちます。最悪の場合、8分間シャットダウンがブロックされ、運用チームは「なぜアプリが終了しないのか？」と困惑することになります。
-
-**問題3：強制終了するとデータ不整合**
-
-待ちきれずにタイムアウトして強制終了すると、処理が中断されます。その結果、データが半端な状態で残る可能性があります。例えば、データは取得したが保存されていない、保存は始まったが完了していない、トランザクションがコミットされていない、といった状態です。
-
-**問題4：リソースリーク**
-
-リクエストが終了しても、コルーチンは動き続けます。同じような処理が何百件も動いていたら、メモリとCPUが無駄に消費され続けることになります。
-
-さらに悪いことに、この問題は1つのリクエストだけでは顕在化しません。以下のように複数のリクエストが来た場合を考えてみましょう：
-
-```kotlin
-// 100件のリクエストが来たとする
-repeat(100) {
-    GlobalScope.launch {
-        val data = fetchLargeDataSet() // 各10分
-        processData(data)
-        saveResults(data)
-    }
-}
-// リクエスト処理は即座に終了
-// でも、100個のコルーチンが10分間動き続ける
-// = 大量のメモリとCPUリソースが消費される
-```
-
-このコードの怖いところは、APIは正常にレスポンスを返すため、一見問題がないように見える点です。しかし、バックグラウンドでは100個のコルーチンが動き続け、サーバーのリソースを圧迫し続けているのです。
-
-#### 解決策：適切なScopeで管理する
-
-GlobalScopeの代わりに、処理のライフサイクルに合わせたScopeを使います。例えば、関数内で完結する処理なら`coroutineScope`を使います：
-
-```kotlin
-// ✅ 良い例 - coroutineScopeを使う
-suspend fun processDataSafely(data: Data): Result = coroutineScope {
-    // このScopeは関数の実行中だけ有効
-    val processed = async {
-        val fetched = fetchLargeDataSet()
-        processData(fetched)
-    }
-    
-    val saved = async {
-        saveResults(processed.await())
-    }
-    
-    // すべての処理が完了してから結果を返す
-    Result.success(saved.await())
-}
-// 関数が終了すると、Scopeも自動的に終了する
-```
-
-この方法のメリット：
-
-- 関数が終了すれば、自動的にすべてのコルーチンがキャンセルされる
-- 処理が構造化され、リソースリークを防げる
-- 明示的な`cancel()`呼び出しが不要
-
-#### cancel()とは？
-
-ここまで「キャンセル」という言葉が何度か出てきましたが、`cancel()`について説明します。
-
-`cancel()`は、**Scopeに紐づくコルーチンの実行を中断し、リソースをクリーンアップする関数**です。呼び出すと：
-
-- 実行中のコルーチンが停止される
-- 子コルーチンもすべて自動的にキャンセルされる
-- 新しいコルーチンを起動できなくなる
-
-イメージとしては「このScopeはもう使わないので、関連するすべての処理を終了してください」という指示です。
-
-#### cancel()を呼ぶ必要があるのはいつ？
-
-Scopeの種類によって、`cancel()`の扱いが異なります：
-
-| Scopeの種類 | cancel()の必要性 | 理由 |
-|------------|-----------------|------|
-| `coroutineScope` | ❌ **不要** | 関数終了時に自動的にキャンセルされる |
-| `runBlocking` | ❌ **不要** | ブロック終了時に自動的にキャンセルされる |
-| カスタムScope | ✅ **必要** | 明示的に`cancel()`を呼ばないとリソースリークする |
-| `GlobalScope` | ⚠️ **使わない** | そもそも本番コードで使用禁止 |
-
-**覚えておくべきこと**：
-
-- `GlobalScope`：**⚠️ 本番コードでは使用禁止**
-- `coroutineScope`：関数内で完結する処理に使う（自動管理）
-- カスタムScope：長期実行タスクに使うが、終了時は必ず`cancel()`を呼ぶ
-
 #### 主なCoroutineScopeの種類
 
-実際の開発では、いくつかの代表的なScopeを使い分けます：
+実際の開発では、いくつかの代表的なScopeを使い分けます。
 
 **1. GlobalScope（アプリケーション全体のスコープ）**
 
@@ -572,6 +466,8 @@ suspend fun fetchMultipleData() = supervisorScope {
 
 **4. カスタムScope（独自のライフサイクルを持つスコープ）**
 
+一度も使用したことないです。
+
 ```kotlin
 class MyService : CoroutineScope {
     private val job = SupervisorJob()
@@ -589,7 +485,7 @@ class MyService : CoroutineScope {
 }
 ```
 
-- **使用場面**：サービスやコンポーネントに紐付いた長期実行タスク
+- **使用場面**：サービスやコンポーネントに紐付いた長期実行タスク（例：バックグラウンドでの一括メール送信、定期的なキャッシュリフレッシュ、KafkaやRabbitMQなどのメッセージキューからのイベント処理など）
 - **特徴**：ライフサイクルを明示的に管理できる
 - **メリット**：適切なタイミングでクリーンアップできる
 
@@ -614,6 +510,44 @@ class UserController {
 Spring WebFluxでは、サスペンド関数を使うだけで自動的に適切なスコープで実行されます。詳細は別の記事で解説します。
 :::
 
+#### 適切にScopeを切らないとどうなるか？
+
+適切なスコープを使わないと、リソースリークやシャットダウンの問題が発生します。
+
+```kotlin
+// ❌ 悪い例：GlobalScopeを使うと問題が起こる
+@RestController
+class DataProcessController {
+    @PostMapping("/process")
+    fun startProcessing(): String {
+        GlobalScope.launch {
+            val data = fetchLargeDataSet() // 10分かかる
+            processData(data)
+            saveResults(data)
+        }
+        return "Processing started" // すぐに返る
+    }
+}
+```
+
+この実装の問題点:
+
+- **リソースリーク**: リクエストが終了してもコルーチンは動き続ける
+- **シャットダウンの問題**: アプリケーション終了時に処理が残ったままになる
+- **管理不能**: 起動したコルーチンを制御する手段がない
+
+解決策は、適切なスコープ（`coroutineScope`など）を使うか、フレームワーク管理のスコープに任せることです。
+
+```kotlin
+// ✅ 良い例：適切なスコープで管理
+suspend fun processDataSafely(data: Data): Result = coroutineScope {
+    val processed = async { processData(data) }
+    val saved = async { saveResults(processed.await()) }
+    Result.success(saved.await())
+}
+// 関数が終了すると、Scopeも自動的に終了する
+```
+
 ### 3. suspend関数：「一時停止できる関数」の目印
 
 `suspend` キーワードは「この関数は途中で一時停止するかもしれない」という目印です。
@@ -634,9 +568,72 @@ suspend fun fetchUserData(): User {
 }
 ```
 
+:::message alert
+**重要：`suspend`をつけただけでは一時停止しない**
+
+`suspend`キーワードは「一時停止する可能性がある」という目印ですが、**キーワードをつけただけでは実際には一時停止しません**。
+
+実際に一時停止するには、**中断ポイント（suspension point）**が必要です。
+
+```kotlin
+// ❌ suspend付いているが一時停止しない
+suspend fun simpleCalculation(): Int {
+    return 1 + 1  // 中断ポイントがない → 普通の関数と同じ
+}
+
+// ✅ suspend付いていて実際に一時停止する
+suspend fun fetchData(): String {
+    delay(1000)  // ← 中断ポイント（他のsuspend関数を呼ぶ）
+    return "data"
+}
+```
+
+**中断ポイントになるもの：**
+
+- 他のsuspend関数を呼び出す（`delay()`, `await()`, API呼び出しなど）
+- `withContext()`でディスパッチャーを切り替える
+- `suspendCoroutine`などの低レベルAPIを使う
+
+**順次実行はデフォルト：**
+
+suspend関数を順番に呼ぶと、それぞれの完了を待ってから次に進みます。
+
+```kotlin
+suspend fun loadUserData(userId: Long) {
+    val user = fetchUser(userId)      // 完了を待つ
+    val orders = fetchOrders(userId)  // userが取得できてから実行
+    println("User: $user, Orders: $orders")
+}
+```
+
+これはKotlin公式ドキュメントの[Composing suspending functions](https://kotlinlang.org/docs/composing-suspending-functions.html)で「Sequential by default」として説明されています。
+
+**並列実行したい場合：**
+
+独立した処理を同時に実行したい場合は、`async`と`await`を使います。
+
+```kotlin
+suspend fun loadUserDataFast(userId: Long) = coroutineScope {
+    // 並列実行：同時に開始
+    val userDeferred = async { fetchUser(userId) }
+    val ordersDeferred = async { fetchOrders(userId) }
+    
+    // 両方の完了を待つ
+    val user = userDeferred.await()
+    val orders = ordersDeferred.await()
+    println("User: $user, Orders: $orders")
+}
+```
+
+:::message
+`coroutineScope`、`async`、`await`については後述します。ここでは「並列実行には別の方法がある」ということを理解してください。
+:::
+
+:::
+
 #### suspend関数の重要なルール
 
-**ルール1**: suspend関数は、他のsuspend関数かコルーチンの中からしか呼べない
+suspend関数は、他のsuspend関数かコルーチンの中からしか呼べない
 
 ```kotlin
 // ❌ これはエラー！
@@ -695,7 +692,7 @@ class UserController(
 }
 ```
 
-この例のポイント：
+この例のポイント。
 
 - `fetchUser`と`fetchPosts`は両方とも suspend関数
 - 呼び出し側から見ると、普通の関数のように「順番に」書ける
@@ -707,7 +704,7 @@ class UserController(
 
 ### ディスパッチャーとスコープ、ビルダーの関係
 
-これまで学んだ要素がどう組み合わさるか見てみましょう：
+これまで学んだ要素がどう組み合わさるか見てみましょう。
 
 ```kotlin
 // runBlockingでScopeを作る
@@ -727,7 +724,7 @@ fun main() = runBlocking {  // ← Scope
 }
 ```
 
-**ポイント**：
+**ポイント**。
 
 - **Scope**：コルーチンの寿命を管理
 - **ビルダー**（`launch`、`async`）：コルーチンを起動
@@ -737,7 +734,7 @@ fun main() = runBlocking {  // ← Scope
 
 **結論：処理内容によって「適切なスレッドプール」が違うから**です。
 
-例えば、Webアプリケーションでは様々な種類の処理があります：
+例えば、Webアプリケーションでは様々な種類の処理があります。
 
 - **CPU集約的な処理**：暗号化、大量のデータ処理など → 専用のスレッドプールで実行すべき
 - **I/O処理**：データベースアクセス、外部API呼び出しなど → I/O専用のスレッドプールで実行すべき
@@ -766,7 +763,7 @@ launch(Dispatchers.IO) {
 
 ### ディスパッチャーを使うメソッド
 
-ディスパッチャーを指定する方法は主に2つあります：
+ディスパッチャーを指定する方法は主に2つあります。
 
 | 方法 | 使い方 | タイミング | 用途 |
 |------|--------|-----------|------|
@@ -775,7 +772,7 @@ launch(Dispatchers.IO) {
 
 #### 1. ビルダーの引数として指定
 
-コルーチンを起動する時に、ビルダーの引数としてディスパッチャーを渡します：
+コルーチンを起動する時に、ビルダーの引数としてディスパッチャーを渡します。
 
 ```kotlin
 launch(Dispatchers.IO) {
@@ -789,7 +786,7 @@ async(Dispatchers.Default) {
 }
 ```
 
-**特徴**：
+**特徴**。
 
 - **新しいコルーチンを起動**する
 - 起動時にディスパッチャーを決定
@@ -801,7 +798,7 @@ async(Dispatchers.Default) {
 
 `launch`は新しいコルーチンを起動しますが、`withContext`は**今動いているコルーチンのまま、実行するスレッドだけを変更**します。
 
-**特徴**：
+**特徴**。
 
 - **既存のコルーチン内で**ディスパッチャーを切り替える
 - 処理完了まで待機してから次に進む（順次実行）
@@ -810,7 +807,7 @@ async(Dispatchers.Default) {
 **使用例：コルーチン内でのディスパッチャー切り替え**
 
 以下の例では、コルーチンビルダー（`launch`）でコルーチンを起動し、その中でサービスの`suspend`関数を呼び出しています。
-サービス層の`processUserData`関数内では、`withContext`を使って処理ごとに適切なディスパッチャーに切り替えています：
+サービス層の`processUserData`関数内では、`withContext`を使って処理ごとに適切なディスパッチャーに切り替えています。
 
 ```kotlin
 // どこかでlaunchを使ってコルーチンを起動
@@ -848,7 +845,7 @@ class UserService {
 
 **launchでは代替できない理由**
 
-`launch`を使うと、各処理が並列に実行されてしまい、前のステップの結果を待たずに次に進んでしまいます：
+`launch`を使うと、各処理が並列に実行されてしまい、前のステップの結果を待たずに次に進んでしまいます。
 
 ```kotlin
 // ❌ これは動かない
@@ -866,22 +863,23 @@ suspend fun processUserDataWrong(userId: Long): String = coroutineScope {
 }
 ```
 
-**withContextとlaunchの使い分け**：
+**withContextとlaunchの使い分け**。
 
 | 特徴 | withContext | launch / async |
 |------|-------------|---------------|
-| **実行方法** | 順番に実行（前の処理が完了してから次へ） | 並列実行（すぐに次の処理に進む） |
+| **役割** | ディスパッチャーを切り替える | 新しいコルーチンを起動する |
+| **実行方法** | 同じコルーチン内で順次実行 | 新しいコルーチンを並列実行 |
 | **結果の受け取り** | 処理結果を直接返せる | `launch`: 返せない / `async`: `await()`で取得 |
-| **用途** | データの変換や加工など、順番が重要な処理 | 独立した処理を並列実行したい場合 |
+| **用途** | ブロッキングAPIの実行スレッドを切り替える | 独立した処理を並列実行したい場合 |
 
 :::message alert
 **並列実行したいときは`withContext`を使わない！**
 
-`withContext`は処理が完了するまで待機する（順次実行）ため、**並列実行には向きません**。
+`withContext`は順次実行されるため、**並列実行には向きません**。
 独立した複数の処理を同時に実行したい場合は、`launch`や`async`を使いましょう。
 :::
 
-`withContext`は処理が完了するまで待ち、結果を返します。処理が終わると、元のディスパッチャーに自動的に戻ります。
+`withContext`は、指定したディスパッチャーでブロック内の処理を実行し、完了したら結果を返します。処理が終わると、元のディスパッチャーに自動的に戻ります。
 
 :::message
 **Spring MVCとSpring WebFluxでのwithContext使用の違い**
@@ -890,7 +888,7 @@ Springでコルーチンを使う場合、MVCとWebFluxでは推奨されるコ�
 
 ### Spring MVC：ブロッキングAPIを使う従来型アプローチ
 
-Spring MVCでコルーチンを使う場合、既存の同期的なライブラリ（RestTemplate、JdbcTemplateなど）をそのまま使うことが多いです。これらはスレッドをブロックするため、`withContext(Dispatchers.IO)`でI/O専用スレッドプールに切り替える必要があります。
+Spring MVCでコルーチンを使う場合、既存の同期的なライブラリ（RestTemplate、FeignClient、JdbcTemplateなど）をそのまま使うことが多いです。これらはスレッドをブロックするため、`withContext(Dispatchers.IO)`でI/O専用スレッドプールに切り替える必要があります。
 
 ```kotlin
 @RestController
@@ -933,7 +931,7 @@ class UserController(
 
 Spring WebFluxでは、WebClientやR2DBCなどのリアクティブライブラリを使用します。これらは既に`suspend`関数として提供されており、内部でノンブロッキングに実装されているため、`withContext(Dispatchers.IO)`は不要です。
 
-Spring公式ドキュメントの[Coroutinesセクション](https://docs.spring.io/spring-framework/reference/languages/kotlin/coroutines.html)でも、以下のように`Dispatchers.IO`を指定せずに実装されています：
+Spring公式ドキュメントの[Coroutinesセクション](https://docs.spring.io/spring-framework/reference/languages/kotlin/coroutines.html)でも、以下のように`Dispatchers.IO`を指定せずに実装されています。
 
 **順次実行の例：**
 
@@ -1002,7 +1000,7 @@ class ParallelController(
 
 ### ただし注意：CPU集約的な処理は別
 
-I/O処理はノンブロッキングですが、**取得したデータに対してCPU集約的な処理を行う場合は`withContext(Dispatchers.Default)`が必要**です：
+I/O処理はノンブロッキングですが、**取得したデータに対してCPU集約的な処理を行う場合は`withContext(Dispatchers.Default)`が必要**です。
 
 ```kotlin
 @RestController
@@ -1030,12 +1028,12 @@ class DataProcessingController(
 
 | フレームワーク | 使用するライブラリ | I/O処理のディスパッチャー | CPU処理のディスパッチャー |
 |-----------|------------|----------------|----------------|
-| **Spring MVC** | RestTemplate、JDBC | `withContext(Dispatchers.IO)` 必要 | `withContext(Dispatchers.Default)` 必要 |
+| **Spring MVC** | RestTemplate、FeignClient、JDBC | `withContext(Dispatchers.IO)` 必要 | `withContext(Dispatchers.Default)` 必要 |
 | **Spring WebFlux** | WebClient、R2DBC | ディスパッチャー指定不要 | `withContext(Dispatchers.Default)` 必要 |
 
 **判断のポイント：**
 
-- MVCで**ブロッキングAPI**（RestTemplate、JDBC等）を使う場合 → `withContext(Dispatchers.IO)`が必要
+- MVCで**ブロッキングAPI**（RestTemplate、FeignClient、JDBC等）を使う場合 → `withContext(Dispatchers.IO)`が必要
 - WebFluxで**リアクティブAPI**（WebClient、R2DBC等）を使う場合 → I/O処理にディスパッチャー指定は不要
 - **どちらの場合でも**、CPU集約的な処理には`withContext(Dispatchers.Default)`が必要
 
@@ -1105,7 +1103,7 @@ class UserService(
 :::message
 **軽い処理ならディスパッチャーを気にしなくてOK**
 
-以下のような処理は、わざわざディスパッチャーを切り替える必要はありません：
+以下のような処理は、わざわざディスパッチャーを切り替える必要はありません。
 
 - 変数の代入や簡単な計算
 - リストの要素数チェックや簡単なフィルタリング
@@ -1114,13 +1112,190 @@ class UserService(
 ディスパッチャーの切り替え自体にもわずかなコストがあるため、**時間のかかる処理だけ**気にすればOKです。
 :::
 
+## 補足：ジョブとコルーチンコンテキスト
+
+ここまでの説明で出てこなかった重要な用語として、**ジョブ**と**コルーチンコンテキスト**があります。これらはコルーチンの内部動作に関わる概念で、基本的な使い方では意識する必要はありませんが、理解しておくとより深く理解できます。
+
+### ジョブ（Job）
+
+**ジョブ**は、コルーチンのライフサイクルを管理するオブジェクトです。
+
+**主な機能：**
+
+1. **キャンセル制御**：コルーチンをキャンセルできる
+2. **完了待機**：コルーチンの完了を待つことができる
+3. **親子関係の管理**：親がキャンセルされると子も自動的にキャンセル
+
+**Jobの主要なメソッド：**
+
+| メソッド | 説明 | 使い方 |
+|---------|------|--------|
+| `cancel()` | コルーチンをキャンセルする | `job.cancel()` |
+| `join()` | コルーチンの完了を待つ（サスペンド関数） | `job.join()` |
+| `cancelAndJoin()` | キャンセルして完了を待つ（`cancel()`+`join()`のショートカット） | `job.cancelAndJoin()` |
+| `isActive` | コルーチンが実行中かどうか | `if (job.isActive) { ... }` |
+| `isCompleted` | コルーチンが完了したかどうか | `if (job.isCompleted) { ... }` |
+| `isCancelled` | コルーチンがキャンセルされたかどうか | `if (job.isCancelled) { ... }` |
+
+**実用的な例：タイムアウト処理**
+
+```kotlin
+suspend fun fetchDataWithTimeout() = coroutineScope {
+    val job = launch {
+        // 時間のかかる処理
+        fetchLargeData()
+    }
+    
+    // 5秒待つ
+    delay(5000)
+    
+    // まだ完了していなければキャンセル
+    if (job.isActive) {
+        println("タイムアウト！キャンセルします")
+        job.cancelAndJoin()
+    }
+}
+```
+
+**ジョブの状態遷移**
+
+ジョブは、コルーチンのライフサイクルに応じて複数の状態を遷移します。これらの状態を理解することで、コルーチンがどの段階にあるかを正確に把握できます。
+
+| 状態 | 説明 |
+|------|------|
+| **New** | 作成されたが、まだ開始されていない（lazy起動の場合） |
+| **Active** | 実行中 |
+| **Completing** | 完了処理中（子コルーチンの完了を待っている） |
+| **Completed** | 正常に完了 |
+| **Cancelling** | キャンセル処理中 |
+| **Cancelled** | キャンセルされて終了 |
+
+**launchとasyncの返り値の違い：**
+
+これまでコルーチンを起動する際に `launch` や `async` を使ってきましたが、実はこれらは起動したコルーチンを管理するためのオブジェクト（Job）を返しています。この2つのビルダーの返り値には重要な違いがあります。
+
+コルーチンビルダーは、起動したコルーチンを管理するためのオブジェクトを返します。
+
+| ビルダー | 返り値 | 意味 | できること |
+|---------|--------|------|-----------|
+| `launch` | `Job` | コルーチンの管理用オブジェクト | キャンセル、完了待機 |
+| `async` | `Deferred<T>` | `Job`を継承し、結果も持つ | Jobと同様にキャンセル、完了待機が可能。そしてawaitで結果の取得も可能 |
+
+**実際の開発では：**
+
+Jobを明示的に扱うのは、以下のような特殊なケースです。
+
+- バックグラウンドタスクを途中でキャンセルしたい
+- 複数のコルーチンをまとめて管理したい
+- カスタムスコープを作成する（サービスクラスなど）
+
+### コルーチンコンテキスト（CoroutineContext）
+
+**コルーチンコンテキスト**は、コルーチンの実行環境を決める「設定の集まり」です。ジョブもこのコンテキストの一部です。
+
+**含まれる主な要素：**
+
+- **ジョブ（Job）**：コルーチンのライフサイクル管理
+- **ディスパッチャー**：どのスレッドで実行するか
+- **コルーチン名**：デバッグ用の名前
+- **例外ハンドラー**：エラー処理の設定
+
+これらの要素は `+` 演算子で組み合わせることができます。例えば、ディスパッチャーとコルーチン名を指定してコルーチンを起動する場合。
+
+```kotlin
+launch(Dispatchers.IO + CoroutineName("MyCoroutine")) {
+    // Dispatchers.IOとコルーチン名を含むコンテキストで実行
+    println("実行中のコルーチン: ${coroutineContext[CoroutineName]}")
+}
+```
+
+**コンテキストの継承と組み合わせ：**
+
+コルーチンコンテキストには、以下の重要な特徴があります。
+
+1. **親のコンテキストを継承する**
+
+```kotlin
+suspend fun example() = coroutineScope {
+    // この coroutineScope は親のコンテキスト（Dispatchers.IOなど）を継承している
+    
+    launch {
+        // このlaunchも親のコンテキストを継承
+        println("親と同じディスパッチャーで実行される")
+    }
+}
+```
+
+2. **`+` 演算子で要素を組み合わせられる**
+
+```kotlin
+// 複数の要素を組み合わせる
+launch(Dispatchers.IO + CoroutineName("DataFetcher") + Job()) {
+    // IO スレッド + 名前 + 独立したJob で実行
+    fetchData()
+}
+```
+
+:::message
+**`Job()` について**
+
+`Job()` は新しいJobインスタンスを作成するファクトリ関数です。コンテキストに明示的に `Job()` を追加すると、親のJobから独立した新しいJobが作成されます。これにより、親がキャンセルされても、このコルーチンはキャンセルされません（逆に、このコルーチンがキャンセルされても親には影響しません）。
+
+通常は親子関係を維持したいため、`Job()` を明示的に指定することは少ないです。特別な理由（親のキャンセルから独立させたいなど）がない限り、省略するのが一般的です。
+
+```kotlin
+// 通常はこう書く（親子関係を維持）
+launch(Dispatchers.IO + CoroutineName("DataFetcher")) {
+    fetchData()
+}
+```
+
+:::
+
+3. **子コルーチンは親のコンテキストを引き継ぐ（構造化された並行性）**
+
+```kotlin
+suspend fun processData() = coroutineScope {
+    // 親のコンテキスト: Dispatchers.Default
+    
+    launch {
+        // 子も Dispatchers.Default を継承
+        println("子コルーチン1: ${Thread.currentThread().name}")
+    }
+    
+    launch(Dispatchers.IO) {
+        // 明示的に指定すると上書きされる
+        println("子コルーチン2: ${Thread.currentThread().name}")
+    }
+}
+```
+
+この継承の仕組みにより、親がキャンセルされると子も自動的にキャンセルされ、構造化された並行性が実現されます。
+
+**実際の開発では：**
+
+通常のアプリケーション開発では、コルーチンコンテキストを明示的に操作することは少なく、ディスパッチャーの指定だけで十分なケースがほとんどです。
+
+:::message
+**いつ詳しく学ぶべき？**
+
+ジョブとコルーチンコンテキストは、以下のようなケースで必要になります。
+
+- カスタムスコープを作成する必要がある
+- 複雑なキャンセル処理を実装する
+- ライブラリを開発する
+- 低レベルのコルーチンAPIを使う
+
+基本的なアプリケーション開発では、この章で学んだ**Scope**、**ビルダー**、**ディスパッチャー**の理解で十分です。
+:::
+
 ## 実践例：複数のAPI呼び出しを速くする
 
 ここまでの知識を使って、実際によくある「複数の外部APIを呼ぶ」場面を最適化してみましょう。以降これを「統合API」と呼びます。
 
 ### シナリオ：統合APIエンドポイントの実装
 
-統合APIエンドポイントを実装するには、以下の3つの外部サービスから情報を取得する必要があります：
+統合APIエンドポイントを実装するには、以下の3つの外部サービスから情報を取得する必要があります。
 
 1. ユーザーサービスからユーザー情報（1秒かかる）
 2. 注文サービスから注文履歴（1秒かかる）
@@ -1134,7 +1309,7 @@ class UserService(
 コルーチンを使えば、これらを並列に実行して**1秒で完了**させることができます！
 :::
 
-### 並列実行の実装（推奨）
+### 依存関係がない場合の実装
 
 ```kotlin
 @Service
@@ -1143,22 +1318,24 @@ class UserProfileService(
     private val orderApiClient: OrderApiClient,
     private val pointApiClient: PointApiClient
 ) {
-    // ✅ 良い例：並列実行で速い
+    // ✅ 良い例：効率的な実行
     suspend fun getUserProfile(userId: Long): UserProfileData = coroutineScope {
         // 3つの外部APIを「同時に」開始
-        val userDeferred = async(Dispatchers.IO) {
+        // ※WebClient（WebFlux）の場合、Dispatcherの指定は不要
+        // ※RestTemplate/FeignClient（MVC）の場合、async(Dispatchers.IO) と指定する
+        val userDeferred = async {
             userApiClient.getUser(userId)
         }
         
-        val ordersDeferred = async(Dispatchers.IO) {
+        val ordersDeferred = async {
             orderApiClient.getOrders(userId)
         }
         
-        val pointsDeferred = async(Dispatchers.IO) {
+        val pointsDeferred = async {
             pointApiClient.getPoints(userId)
         }
         
-        // 全ての結果を待つ（3つとも並列で実行されている）
+        // 全ての結果を待つ
         val user = userDeferred.await()
         val orders = ordersDeferred.await()
         val points = pointsDeferred.await()
@@ -1169,7 +1346,23 @@ class UserProfileService(
 }
 ```
 
-**このコードの動き（タイムライン）**：
+**WebFlux vs MVC：**
+
+使用するHTTPクライアントによって、スレッドの使い方が異なります。
+
+**WebFlux（WebClient）の場合：**
+
+- 1つのリクエスト内：1つのスレッドが3つのコルーチンを切り替えながら実行（**並行処理**）
+- 複数のリクエスト間：少数のイベントループスレッドが複数ユーザーのリクエストを処理（**並列処理**）
+- 特徴：スレッドはブロックされず、効率的に多数のリクエストを同時処理可能
+
+**MVC（RestTemplate/FeignClient）の場合：**
+
+- 1つのリクエスト内：`async(Dispatchers.IO)`で3つのIOスレッドが実行（**並列処理**）
+- 複数のリクエスト間：各リクエストが独立したスレッドプールのスレッドで実行（**並列処理**）
+- 特徴：スレッド数は多く必要だが、理解しやすいモデル
+
+**このコードの動き（タイムライン）**。
 
 ```text
 時刻0秒：3つのasyncを全て開始
@@ -1177,7 +1370,7 @@ class UserProfileService(
   ├─ async2: 注文履歴取得開始
   └─ async3: ポイント残高取得開始
 
-時刻1秒：3つとも完了（並列実行されたから）
+時刻1秒：3つとも完了
   ├─ async1: 完了 ✓
   ├─ async2: 完了 ✓
   └─ async3: 完了 ✓
@@ -1190,45 +1383,64 @@ await()で結果を受け取る（既に完了しているので即座に返る�
 「ユーザー情報を取得してから、そのユーザーの設定に基づいて別の処理を行う」のように、依存関係がある場合はどうするか？
 
 :::message
-**前提：APIクライアントが既にsuspend関数の場合**
+**withContextは「結果を待つ」ために使うものではない**
 
-この例では、APIクライアントのメソッドが既に`suspend fun getUser(): User`のように定義されていることを想定しています。
-このような場合、APIクライアント側で既に適切なスレッド管理がされているため、呼び出し側で`withContext(Dispatchers.IO)`を使う必要はありません。
+依存関係がある処理で結果を待ちたい場合、**ディスパッチャーの切り替えが必要でなければ`withContext`は不要**です。
+
+- **suspend関数を呼ぶだけで結果を待てる** → `withContext`不要
+- **ブロッキングAPIを呼ぶ必要がある** → `withContext(Dispatchers.IO)`が必要（スレッドを切り替えるため）
+
+つまり、`withContext`の役割は。
+
+- ✅ **ディスパッチャーを切り替える**（ブロッキング処理をI/Oスレッドで実行など）
+- ❌ **単に結果を待つ**（これはsuspend関数の呼び出しだけで十分）
+
+この例では、APIクライアントが既に`suspend fun getUser(): User`のように定義されていることを想定しています。
+このような場合、APIクライアント側で既に適切なスレッド管理がされているため、呼び出し側で`withContext`を使う必要はありません。
 
 もしAPIクライアントが同期的（ブロッキング）な実装の場合は、前述の「Spring MVCとWebFluxの違い」を参照してください。
 :::
 
-**実装例：suspend関数を順次・並列実行**
+次のような要件を持つレコメンデーション機能を実装する2つのケースを見ていきます。
+
+**要件：**
+
+1. **ユーザー情報を取得**（`getUser`）
+2. **ユーザー情報に依存する処理**。
+   - おすすめ商品取得（`getRecommendedProducts`）
+   - お気に入りカテゴリ情報取得（`getFavoriteCategories`）
+   - プレミアム商品取得（`getPremiumProducts`）
+3. **ユーザー情報に依存しない処理**。
+   - 最新ニュース取得（`getLatestNews`）
+
+この要件に対して、2つの異なる実装ケースを見ていきましょう。
+
+#### ケース1：ユーザー依存の処理のみ（基本的な実装）
+
+まずユーザー情報を取得してから、それに依存する処理を並列実行するケースです。
 
 ```kotlin
 @Service
 class RecommendationService(
-    private val userApiClient: UserApiClient, // suspend関数を提供
+    private val userApiClient: UserApiClient,
     private val productApiClient: ProductApiClient,
     private val categoryApiClient: CategoryApiClient
 ) {
     suspend fun getRecommendations(userId: Long): RecommendationData = coroutineScope {
-        // ステップ1: ユーザー情報を取得（後続処理で必要なので待つ）
-        // APIクライアントが既にsuspend関数なので、withContextは不要
+        // ステップ1: ユーザー情報を取得（他の処理の前提条件）
         val user = userApiClient.getUser(userId)
-        
-        val favoriteCategories = user.preferences.favoriteCategories
         
         // ステップ2: ユーザー情報を使った処理を並列実行
         val productsDeferred = async {
-            productApiClient.getProducts(favoriteCategories)
+            productApiClient.getRecommendedProducts(user)
         }
         
         val categoriesDeferred = async {
-            categoryApiClient.getCategories(favoriteCategories)
+            categoryApiClient.getFavoriteCategories(user)
         }
         
         val premiumContentDeferred = async {
-            if (user.isPremiumMember) {
-                productApiClient.getPremiumProducts()
-            } else {
-                emptyList()
-            }
+            productApiClient.getPremiumProducts(user)
         }
         
         RecommendationData(
@@ -1241,7 +1453,199 @@ class RecommendationService(
 }
 ```
 
-**このコードの入れ子構造**：
+**WebFlux vs MVC：**
+
+使用するHTTPクライアントによって、スレッドの使い方が異なります。
+
+**WebFlux（WebClient）の場合：**
+
+- 1つのリクエスト内：最初の`getUser()`で中断後、3つのasyncを同じスレッドで切り替え実行（**並行処理**）
+- 複数のリクエスト間：少数のイベントループスレッドが複数ユーザーのリクエストを処理（**並列処理**）
+- 特徴：スレッドはブロックされず、効率的に多数のリクエストを同時処理可能
+
+**MVC（RestTemplate/FeignClient）の場合：**
+
+- 1つのリクエスト内：最初は`getUser()`で1スレッドがブロック、その後3つのIOスレッドが実行（**並列処理**）
+- 複数のリクエスト間：各リクエストが独立したスレッドプールのスレッドで実行（**並列処理**）
+- 特徴：スレッド数は多く必要だが、理解しやすいモデル
+
+**実行フロー：**
+
+※以下はWebClient（WebFlux）を使用した場合の動作です。
+
+重要な理解。
+
+- **コルーチンの中断**: コルーチンAが結果待ちで中断されるが、スレッドはブロックされない
+- **スレッドの動き**: スレッド1は他のコルーチン（B、C、Dなど）や別のリクエストを処理し続ける
+  - この図では説明のため1つのリクエストのみを表示していますが、実際の本番環境では、スレッド1は複数のユーザーからの同時リクエストを次々と処理します
+  - コルーチンAが中断されている間、スレッド1は別のユーザー2さんのリクエスト処理、3さんのリクエスト処理などを行います
+- **MVC（RestTemplate/FeignClient）の場合**: async内でDispatchers.IOスレッドに切り替わり、そのスレッドはAPI応答までブロックされる
+
+```mermaid
+sequenceDiagram
+    participant A as コルーチンA
+    participant B as コルーチンB:商品取得
+    participant C as コルーチンC:カテゴリ取得
+    participant D as コルーチンD:プレミアム商品取得
+    participant T as スレッド1
+
+    Note over A,T: 時刻0秒
+    A->>A: getUser()呼び出し
+    Note over A: コルーチンA中断(待機状態)
+    Note over T: スレッド1は他の処理を継続
+
+    Note over A,T: 時刻0.5秒
+    Note over A: getUser()完了
+    Note over A: コルーチンA再開
+    A->>B: async起動
+    A->>C: async起動
+    A->>D: async起動
+    Note over B: コルーチンB中断(待機状態)
+    Note over C: コルーチンC中断(待機状態)
+    Note over D: コルーチンD中断(待機状態)
+    Note over T: スレッド1は他の処理を継続
+
+    Note over A,T: 時刻1秒
+    B->>A: 完了
+    C->>A: 完了
+    D->>A: 完了
+    A->>A: await()で結果収集・終了
+```
+
+**特徴：**
+
+- ✅ シンプルで理解しやすい実装
+- ✅ 依存関係が明確
+- ✅ 多くの場面で十分な性能
+
+#### ケース2：独立した処理も追加（最適化した実装）
+
+ケース1に加えて、ユーザーに依存しない処理も追加し、最初から同時実行するケースの実装をみてましょう。
+
+**ケース1からの変更点：**
+
+- ユーザー情報に依存しない処理（最新ニュース取得）を最初から開始する
+
+```kotlin
+@Service
+class RecommendationService(
+    private val userApiClient: UserApiClient,
+    private val productApiClient: ProductApiClient,
+    private val categoryApiClient: CategoryApiClient,
+    private val newsApiClient: NewsApiClient
+) {
+    suspend fun getRecommendations(userId: Long): RecommendationData = coroutineScope {
+        // ステップ1: 独立した処理は同時に開始
+        val userDeferred = async {
+            userApiClient.getUser(userId)
+        }
+        
+        val latestNewsDeferred = async {
+            newsApiClient.getLatestNews()  // ユーザーに依存しないので即座に開始
+        }
+        
+        // ステップ2: ユーザー情報が必要になったら待つ
+        val user = userDeferred.await()
+        
+        // ステップ3: ユーザー情報を使った処理を並列実行
+        val productsDeferred = async {
+            productApiClient.getRecommendedProducts(user)
+        }
+        
+        val categoriesDeferred = async {
+            categoryApiClient.getFavoriteCategories(user)
+        }
+        
+        val premiumContentDeferred = async {
+            productApiClient.getPremiumProducts(user)
+        }
+        
+        RecommendationData(
+            user = user,
+            latestNews = latestNewsDeferred.await(),
+            products = productsDeferred.await(),
+            categories = categoriesDeferred.await(),
+            premiumContent = premiumContentDeferred.await()
+        )
+    }
+}
+```
+
+**WebFlux vs MVC：**
+
+使用するHTTPクライアントによって、スレッドの使い方が異なります。
+
+**WebFlux（WebClient）の場合：**
+
+- 1つのリクエスト内：1つのスレッドが複数のコルーチンを切り替えながら実行（**並行処理**）
+- 複数のリクエスト間：少数のイベントループスレッドが複数ユーザーのリクエストを処理（**並列処理**）
+- 特徴：スレッドはブロックされず、効率的に多数のリクエストを同時処理可能
+
+**MVC（RestTemplate/FeignClient）の場合：**
+
+- 1つのリクエスト内：`async(Dispatchers.IO)`で最大5つのIOスレッドが実行（**並列処理**）
+- 複数のリクエスト間：各リクエストが独立したスレッドプールのスレッドで実行（**並列処理**）
+- 特徴：スレッド数は多く必要だが、理解しやすいモデル
+
+**実行フロー：**
+
+※以下はWebClient（WebFlux）を使用した場合の動作です。
+
+重要な理解。
+
+- **コルーチンの中断**: コルーチンが結果待ちで中断されるが、スレッドはブロックされない
+- **スレッドの動き**: スレッド1は他のコルーチン（B、C、Dなど）や別のリクエストを処理し続ける
+- **MVC（RestTemplate/FeignClient）の場合**: async内でDispatchers.IOスレッドに切り替わり、そのスレッドはAPI応答までブロックされる
+
+```mermaid
+sequenceDiagram
+    participant A as コルーチンA
+    participant B as コルーチンB(User)
+    participant C as コルーチンC(News)
+    participant D as コルーチンD(Products)
+    participant E as コルーチンE(Categories)
+    participant F as コルーチンF(Premium)
+    participant T as スレッド1
+
+    Note over A,T: 時刻0秒
+    A->>B: async起動
+    A->>C: async起動
+    Note over B,C: ★独立処理も同時開始
+    Note over B: コルーチンB中断(待機状態)
+    Note over C: コルーチンC中断(待機状態)
+    Note over T: スレッド1は他の処理を継続
+
+    Note over A,T: 時刻0.5秒
+    Note over B: getUser()完了
+    B->>A: 結果を返す
+    Note over A: await()で受け取り
+    A->>D: async起動
+    A->>E: async起動
+    A->>F: async起動
+    Note over D: コルーチンD中断(待機状態)
+    Note over E: コルーチンE中断(待機状態)
+    Note over F: コルーチンF中断(待機状態)
+    Note over T: スレッド1は他の処理を継続
+
+    Note over A,T: 時刻1秒
+    C->>A: 完了
+    D->>A: 完了
+    E->>A: 完了
+    F->>A: 完了
+    A->>A: await()で結果収集・終了
+```
+
+**特徴：**
+
+- ✅ 依存関係を正しく考慮しつつ、独立した処理を先行実行
+- ✅ 最速の実行時間（待ち時間を最大限活用）
+- ✅ スレッドを最大限効率的に活用
+
+依存のない処理は並列で
+
+``` text
+
+**このコードの入れ子構造**。
 
 ```text
 someScope（呼び出し元のスコープ）
@@ -1258,7 +1662,7 @@ someScope（呼び出し元のスコープ）
 - **新しいスコープを作るだけ**：`coroutineScope`（親コルーチンをそのまま使う）
 - **suspend関数の呼び出し**：現在のコルーチンで実行（新しいコルーチンやスレッド切り替えは発生しない）
 
-呼び出し側：
+呼び出し側。
 
 ```kotlin
 someScope.launch {
@@ -1267,82 +1671,11 @@ someScope.launch {
 }
 ```
 
-**ポイント**：
+**ポイント**。
 
 1. 依存関係がある処理は順番に実行（suspend関数を直接呼び出す）
-2. 独立した処理は並列実行（`async`を使い、後で`await`）
-3. できるだけ並列実行の部分を多くすると速くなる
-
-### 並列実行の効果を測定
-
-実際にどれくらい速くなるか、タイマーで測ってみましょう
-
-[Kotlin Playground](https://play.kotlinlang.org/#eyJ2ZXJzaW9uIjoiMi4yLjIxIiwicGxhdGZvcm0iOiJqYXZhIiwiYXJncyI6IiIsIm5vbmVNYXJrZXJzIjp0cnVlLCJ0aGVtZSI6ImlkZWEiLCJjb2RlIjoiaW1wb3J0IGtvdGxpbnguY29yb3V0aW5lcy4qXG5pbXBvcnQga290bGluLnN5c3RlbS5tZWFzdXJlVGltZU1pbGxpc1xuXG4vLyDjg4Djg5/jg7zjga5BUEnlkbzjgbPlh7rjgZfvvIjlkIQx56eS44GL44GL44KL77yJXG5zdXNwZW5kIGZ1biBmZXRjaFVzZXIodXNlcklkOiBTdHJpbmcpOiBTdHJpbmcge1xuICAgIGRlbGF5KDEwMDApXG4gICAgcmV0dXJuIFwiVXNlcigkdXNlcklkKVwiXG59XG5cbnN1c3BlbmQgZnVuIGZldGNoT3JkZXJzKHVzZXJJZDogU3RyaW5nKTogU3RyaW5nIHtcbiAgICBkZWxheSgxMDAwKVxuICAgIHJldHVybiBcIk9yZGVycyBmb3IgJHVzZXJJZFwiXG59XG5cbnN1c3BlbmQgZnVuIGZldGNoUG9pbnRzKHVzZXJJZDogU3RyaW5nKTogU3RyaW5nIHtcbiAgICBkZWxheSgxMDAwKVxuICAgIHJldHVybiBcIlBvaW50cyBmb3IgJHVzZXJJZFwiXG59XG5cbi8vIOmAkOasoeWun+ihjOeJiO+8iOmBheOBhO+8iVxuc3VzcGVuZCBmdW4gbG9hZFVzZXJTY3JlZW5TZXF1ZW50aWFsKHVzZXJJZDogU3RyaW5nKTogU3RyaW5nIHtcbiAgICB2YWwgdXNlciA9IGZldGNoVXNlcih1c2VySWQpXG4gICAgdmFsIG9yZGVycyA9IGZldGNoT3JkZXJzKHVzZXJJZClcbiAgICB2YWwgcG9pbnRzID0gZmV0Y2hQb2ludHModXNlcklkKVxuICAgIHJldHVybiBcIiR1c2VyLCAkb3JkZXJzLCAkcG9pbnRzXCJcbn1cblxuLy8g5Lim5YiX5a6f6KGM54mI77yI6YCf44GE77yJXG5zdXNwZW5kIGZ1biBsb2FkVXNlclNjcmVlbih1c2VySWQ6IFN0cmluZyk6IFN0cmluZyA9IGNvcm91dGluZVNjb3BlIHtcbiAgICB2YWwgdXNlckRlZmVycmVkID0gYXN5bmMoRGlzcGF0Y2hlcnMuSU8pIHsgZmV0Y2hVc2VyKHVzZXJJZCkgfVxuICAgIHZhbCBvcmRlcnNEZWZlcnJlZCA9IGFzeW5jKERpc3BhdGNoZXJzLklPKSB7IGZldGNoT3JkZXJzKHVzZXJJZCkgfVxuICAgIHZhbCBwb2ludHNEZWZlcnJlZCA9IGFzeW5jKERpc3BhdGNoZXJzLklPKSB7IGZldGNoUG9pbnRzKHVzZXJJZCkgfVxuICAgIFxuICAgIFwiJHt1c2VyRGVmZXJyZWQuYXdhaXQoKX0sICR7b3JkZXJzRGVmZXJyZWQuYXdhaXQoKX0sICR7cG9pbnRzRGVmZXJyZWQuYXdhaXQoKX1cIlxufVxuXG4vLyDlrp/ooYzjgZfjgabmr5TovINcbnN1c3BlbmQgZnVuIGNvbXBhcmVQZXJmb3JtYW5jZSgpIHtcbiAgICB2YWwgc2VxdWVudGlhbFRpbWUgPSBtZWFzdXJlVGltZU1pbGxpcyB7XG4gICAgICAgIGxvYWRVc2VyU2NyZWVuU2VxdWVudGlhbChcIjEyM1wiKVxuICAgIH1cbiAgICBcbiAgICB2YWwgcGFyYWxsZWxUaW1lID0gbWVhc3VyZVRpbWVNaWxsaXMge1xuICAgICAgICBsb2FkVXNlclNjcmVlbihcIjEyM1wiKVxuICAgIH1cbiAgICBcbiAgICBwcmludGxuKFwi6YCQ5qyh5a6f6KGMOiAke3NlcXVlbnRpYWxUaW1lfW1zXCIpICAvLyDntIQzMDAwbXNcbiAgICBwcmludGxuKFwi5Lim5YiX5a6f6KGMOiAke3BhcmFsbGVsVGltZX1tc1wiKSAgICAvLyDntIQxMDAwbXNcbiAgICBwcmludGxuKFwi5pS55ZaE546HOiAkeyhzZXF1ZW50aWFsVGltZS50b0Zsb2F0KCkgLyBwYXJhbGxlbFRpbWUgKiAxMDApLnRvSW50KCl9JVwiKSAvLyDntIQzMDAlXG59XG5cbmZ1biBtYWluKCkgPSBydW5CbG9ja2luZyB7XG4gICAgY29tcGFyZVBlcmZvcm1hbmNlKClcbn0ifQ==)でそのまま実行できます。
-
-```kotlin
-import kotlinx.coroutines.*
-import kotlin.system.measureTimeMillis
-
-// ダミーのAPI呼び出し（各1秒かかる）
-suspend fun fetchUser(userId: String): String {
-    delay(1000)
-    return "User($userId)"
-}
-
-suspend fun fetchOrders(userId: String): String {
-    delay(1000)
-    return "Orders for $userId"
-}
-
-suspend fun fetchPoints(userId: String): String {
-    delay(1000)
-    return "Points for $userId"
-}
-
-// 逐次実行版（遅い）
-suspend fun loadUserScreenSequential(userId: String): String {
-    val user = fetchUser(userId)
-    val orders = fetchOrders(userId)
-    val points = fetchPoints(userId)
-    return "$user, $orders, $points"
-}
-
-// 並列実行版（速い）
-suspend fun loadUserScreen(userId: String): String = coroutineScope {
-    val userDeferred = async(Dispatchers.IO){ fetchUser(userId) }
-    val ordersDeferred = async(Dispatchers.IO) { fetchOrders(userId) }
-    val pointsDeferred = async(Dispatchers.IO) { fetchPoints(userId) }
-    
-    "${userDeferred.await()}, ${ordersDeferred.await()}, ${pointsDeferred.await()}"
-}
-
-// 実行して比較
-suspend fun comparePerformance() {
-    val sequentialTime = measureTimeMillis {
-        loadUserScreenSequential("123")
-    }
-    
-    val parallelTime = measureTimeMillis {
-        loadUserScreen("123")
-    }
-    
-    println("逐次実行: ${sequentialTime}ms")  // 約3000ms
-    println("並列実行: ${parallelTime}ms")    // 約1000ms
-    println("改善率: ${(sequentialTime.toFloat() / parallelTime * 100).toInt()}%") // 約300%
-}
-
-fun main() = runBlocking {
-    comparePerformance()
-}
-```
-
-実行すると以下のような結果が得られ、並列実行のほうが早いのがわかると思います。
-
-``` text
-逐次実行: 3008ms
-並列実行: 1014ms
-改善率: 296%
-```
+2. 独立した処理は同時実行（`async`を使い、後で`await`）
+3. できるだけ同時実行の部分を多くすると速くなる
 
 ## よくある間違いと落とし穴
 
@@ -1353,13 +1686,13 @@ fun main() = runBlocking {
 :::message alert
 **GlobalScopeは使わない！**
 
-`GlobalScope`は**本番コードでは絶対に使わない**でください。以前のセクションで説明した通り、アプリケーション全体のライフサイクルに紐づいているため：
+`GlobalScope`は**本番コードでは絶対に使わない**でください。以前のセクションで説明した通り、アプリケーション全体のライフサイクルに紐づいているため。
 
 - リクエストが終了してもコルーチンが動き続ける
 - リソースリークやメモリリークの原因になる
 - 適切なタイミングでキャンセルできない
 
-**正しい方法**：
+**正しい方法**。
 
 - `suspend`関数を使う（フレームワークが自動管理）
 - 適切なスコープ（`coroutineScope`、`supervisorScope`）を使う
@@ -1400,7 +1733,7 @@ suspend fun formatText(text: String): String {
 
 #### 判断基準
 
-`suspend`を付けるべきかどうか迷ったら、以下のチェックリストを使いましょう。4つのうちいずれかに当てはまる場合のみ`suspend`を付けます：
+`suspend`を付けるべきかどうか迷ったら、以下のチェックリストを使いましょう。4つのうちいずれかに当てはまる場合のみ`suspend`を付けます。
 
 1. `delay()`を使う場合
 2. 他のsuspend関数を呼ぶ場合
@@ -1442,43 +1775,23 @@ suspend fun loadUserData(): User {
 - スレッドの切り替えにはコストがかかる（わずかだが積み重なる）
 - コードが読みにくくなる
 
-#### 正しい使い方
+:::message
+**コンテキストスイッチのコストについて**
 
-```kotlin
-// ✅ 良い例：withContextは一度だけ
-suspend fun loadUserData(): User {
-    return withContext(Dispatchers.IO) {
-        // この中は全てIOスレッドで実行される
-        val userData = apiService.getUser()
-        val profileData = apiService.getProfile()
-        User(userData, profileData)
-    }
-}
+コルーチンのディスパッチャー切り替え（コンテキストスイッチ）は、OSレベルのスレッドコンテキストスイッチと比べて**非常に軽量**です。スレッドのコンテキストスイッチは数千～数万ナノ秒かかるのに対し、コルーチンのコンテキストスイッチは数十～数百ナノ秒程度で済みます。
 
-// ✅ または、関数を分けてそれぞれにwithContextを使う
-suspend fun getUserData(): UserData {
-    return withContext(Dispatchers.IO) {
-        apiService.getUser()
-    }
-}
+しかし、**軽量だからといって無駄に使うべきではありません**。
 
-suspend fun getProfileData(): ProfileData {
-    return withContext(Dispatchers.IO) {
-        apiService.getProfile()
-    }
-}
+- 不要なコンテキストスイッチは、わずかでもオーバーヘッドを生む
+- 既に適切なディスパッチャー上にいるのに切り替えても意味がない
+- コードの可読性も下がる（「なぜここでディスパッチャーを切り替えているのか？」という疑問を生む）
 
-// 呼び出し側
-suspend fun loadUserData(): User {
-    val userData = getUserData() // 内部でIOスレッドに切り替え
-    val profileData = getProfileData() // 内部でIOスレッドに切り替え
-    return User(userData, profileData)
-}
-```
+つまり、「コストが低いから気にしなくていい」ではなく、「コストは低いが、不要なら避けるべき」という考え方が正しいです。
+:::
 
 #### 実用的なパターン
 
-異なるディスパッチャーが必要な場合のみ、複数の `withContext` を使います：
+異なるディスパッチャーが必要な場合のみ、複数の `withContext` を使います。
 
 ```kotlin
 // ✅ 良い例：異なるディスパッチャーを使い分ける
@@ -1506,7 +1819,7 @@ suspend fun processData(): Result {
 
 #### 何が問題なのか？
 
-`runBlocking` は「ブロッキング」という名前の通り、スレッドを完全に止めてしまいます。特にAndroidのメインスレッドで使うと、アプリが固まります。
+`runBlocking` は「ブロッキング」という名前の通り、スレッドを完全に止めてしまいます。
 
 #### 間違った例とその影響
 
@@ -1568,7 +1881,7 @@ class OrderService {
 
 #### runBlockingが適切な場面
 
-`runBlocking` が適切なのは、以下の場合のみです：
+`runBlocking` が適切なのは、以下の場合のみです。
 
 **1. テストコード**
 
@@ -1618,30 +1931,53 @@ class LegacyService {
 
 レガシーコードとの橋渡しで、どうしても必要な場合のみ使うことができますが、これは最終手段と考えてください。可能な限り、呼び出し側もsuspend関数に変更するのが望ましいです。
 
-## コルーチンのキャンセル
+## 実務でよく使うコルーチン機能
 
-コルーチンは協調的なキャンセルをサポートしています。
+ここまでコルーチンの基本的な使い方を説明してきましたが、実務では「処理をキャンセルしたい」「タイムアウトを設定したい」「デバッグしたい」といった場面に遭遇します。ここからは、そういった実践的なシーンで役立つ機能を紹介します。
 
-### キャンセル可能なコルーチン
+### コルーチンのキャンセル
+
+コルーチンは**協調的なキャンセル**をサポートしています。長時間実行されるタスクを途中で停止したり、不要になった処理をキャンセルしたりすることができます。
+
+:::message
+**協調的なキャンセルとは？**
+
+協調的なキャンセルとは、コルーチン側が自発的にキャンセル状態をチェックして、適切なタイミングで処理を停止する方式です。スレッドを強制的に停止するのではなく、コルーチンが自らキャンセルに協力します。
+
+- **利点**：リソースの適切な解放、データの整合性を保ちやすい
+- **注意点**：`delay()` や `yield()` などのサスペンド関数を呼ぶか、`isActive` を明示的にチェックする必要がある
+
+これにより、安全で予測可能なキャンセル処理が実現できます。
+:::
+
+### キャンセルの基本
+
+コルーチンをキャンセルするには、`launch` が返す `Job` オブジェクト（または `async` が返す `Deferred<T>` オブジェクト）の `cancel()` や `cancelAndJoin()` メソッドを使用します。これらのメソッドについては、前述の「補足：ジョブとコルーチンコンテキスト」セクションで詳しく説明しています。
+
+`kotlinx.coroutines` の全てのサスペンド関数（`delay()` など）は**キャンセル可能（cancellable）**です。これらの関数は内部でキャンセル状態を自動的にチェックし、キャンセルされていれば `CancellationException` をスローします（[公式ドキュメント参照](https://github.com/Kotlin/kotlinx.coroutines/blob/master/docs/topics/cancellation-and-timeouts.md#cancellation-is-cooperative)）。
+
+### 計算処理をキャンセル可能にする
+
+注意すべき点として、**`suspend` 関数であっても、その中でサスペンド関数を呼ばなければキャンセルできない**ということです。例えば以下のコードは `suspend` 関数ですが、キャンセルされません。
 
 ```kotlin
-val job = launch {
-    repeat(1000) { i ->
-        println("job: I'm sleeping $i ...")
-        delay(500)
+suspend fun heavyComputation(): Int {
+    var result = 0
+    for (i in 0..1_000_000_000) {
+        result += i  // サスペンド関数を呼んでいないのでキャンセルされない
     }
+    return result
 }
-
-delay(1300) // 1.3秒待つ
-println("main: I'm tired of waiting!")
-job.cancel() // ジョブをキャンセル
-job.join() // キャンセル完了を待つ
-println("main: Now I can quit.")
 ```
 
-### キャンセルをチェックする
+`suspend` キーワードは「この関数は中断可能である」という宣言です。自動的にキャンセルチェックをするわけではありません。キャンセル可能にするには、内部でサスペンド関数（`delay()` など）を呼ぶか、明示的にキャンセル状態をチェックする必要があります。
 
-CPU負荷の高い処理では `isActive` でキャンセルをチェック：
+計算ループなど、サスペンド関数を呼ばないコードをキャンセル可能にするには、2つのアプローチがあります（[公式ドキュメント参照](https://github.com/Kotlin/kotlinx.coroutines/blob/master/docs/topics/cancellation-and-timeouts.md#making-computation-code-cancellable)）。
+
+1. 定期的に `yield()` や `ensureActive()` などのサスペンド関数を呼ぶ
+2. 明示的に `isActive` プロパティでキャンセル状態をチェックする
+
+ここでは2つ目のアプローチを示します。
 
 ```kotlin
 val job = launch(Dispatchers.Default) {
@@ -1659,295 +1995,91 @@ delay(1300)
 job.cancelAndJoin() // cancel + join
 ```
 
-### finallyブロックでクリーンアップ
+### タイムアウト
+
+コルーチンが指定した時間内に完了しない場合、自動的にキャンセルしたいことがよくあります。Kotlinコルーチンは、タイムアウト処理のための便利な関数を提供しています。
+
+#### withTimeout - 例外をスローする
+
+`withTimeout` を使うと、指定した時間を超えると `TimeoutCancellationException` がスローされます。
 
 ```kotlin
-val job = launch {
-    try {
-        repeat(1000) { i ->
-            println("job: I'm sleeping $i ...")
-            delay(500)
+suspend fun fetchUserWithTimeout(userId: Long): User = coroutineScope {
+    withTimeout(3000) { // 3秒でタイムアウト
+        // 外部APIを呼び出し（時間がかかる可能性がある）
+        launch {
+            println("ユーザー情報取得開始: $userId")
         }
-    } finally {
-        println("job: I'm running finally")
-        // リソースのクリーンアップ処理
+        fetchUserFromExternalApi(userId)
     }
 }
 
-delay(1300)
-job.cancelAndJoin()
-```
-
-## タイムアウト
-
-一定時間で処理を打ち切りたい場合：
-
-```kotlin
-// TimeoutCancellationExceptionをスロー
-withTimeout(1300) {
-    repeat(1000) { i ->
-        println("I'm sleeping $i ...")
-        delay(500)
-    }
-}
-
-// nullを返す（例外をスローしない）
-val result = withTimeoutOrNull(1300) {
-    repeat(1000) { i ->
-        println("I'm sleeping $i ...")
-        delay(500)
-    }
-    "Done"
-}
-println(result) // null
-```
-
-## Flow：非同期データストリーム
-
-Flowは複数の値を順次返す非同期ストリームです。
-
-### 基本的なFlow
-
-```kotlin
-fun simple(): Flow<Int> = flow {
-    for (i in 1..3) {
-        delay(100) // 非同期に値を生成
-        emit(i) // 値を送出
-    }
-}
-
-fun main() = runBlocking {
-    simple().collect { value ->
-        println(value)
-    }
-}
-// 出力：1, 2, 3（それぞれ100ms間隔）
-```
-
-### Flowの演算子
-
-```kotlin
-fun main() = runBlocking {
-    (1..5).asFlow()
-        .filter { it % 2 == 0 } // 偶数のみ
-        .map { "Value: $it" }    // 変換
-        .collect { println(it) }
-}
-// 出力：
-// Value: 2
-// Value: 4
-```
-
-### Flowのコンテキスト
-
-```kotlin
-fun simple(): Flow<Int> = flow {
-    println("Started flow on ${Thread.currentThread().name}")
-    for (i in 1..3) {
-        emit(i)
-    }
-}.flowOn(Dispatchers.Default) // Flowの実行コンテキストを変更
-
-fun main() = runBlocking {
-    simple()
-        .collect { value ->
-            println("Collected $value on ${Thread.currentThread().name}")
-        }
-}
-```
-
-### StateFlowとSharedFlow
-
-UIの状態管理に便利：
-
-```kotlin
-class ViewModel {
-    // 状態を保持（最新の値を常に持つ）
-    private val _uiState = MutableStateFlow<UiState>(UiState.Loading)
-    val uiState: StateFlow<UiState> = _uiState.asStateFlow()
-    
-    // イベントストリーム（最新の値を保持しない）
-    private val _events = MutableSharedFlow<Event>()
-    val events: SharedFlow<Event> = _events.asSharedFlow()
-    
-    fun loadData() {
-        viewModelScope.launch {
-            try {
-                val data = fetchData()
-                _uiState.value = UiState.Success(data)
-            } catch (e: Exception) {
-                _events.emit(Event.ShowError(e.message))
-            }
+// Springのコントローラーでの使用例
+@RestController
+class UserController {
+    suspend fun getUser(@PathVariable userId: Long): ResponseEntity<User> {
+        return try {
+            val user = fetchUserWithTimeout(userId)
+            ResponseEntity.ok(user)
+        } catch (e: TimeoutCancellationException) {
+            // タイムアウトした場合は503を返す
+            ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE).build()
         }
     }
 }
 ```
 
-## チャネル：コルーチン間の通信
+#### withTimeoutOrNull - nullを返す
 
-チャネルは値のストリームを送受信するための手段です。
-
-```kotlin
-val channel = Channel<Int>()
-
-launch {
-    for (x in 1..5) {
-        channel.send(x * x) // 値を送信
-    }
-    channel.close() // 送信完了
-}
-
-launch {
-    for (y in channel) { // 値を受信
-        println(y)
-    }
-    println("Done!")
-}
-```
-
-### プロデューサー・コンシューマーパターン
+例外を避けたい場合は、`withTimeoutOrNull` を使います。タイムアウトすると `null` を返すので、エラーハンドリングがシンプルになります。
 
 ```kotlin
-fun CoroutineScope.produceNumbers() = produce<Int> {
-    var x = 1
-    while (true) {
-        send(x++) // 無限に数値を生成
-        delay(100)
-    }
-}
-
-fun CoroutineScope.square(numbers: ReceiveChannel<Int>) = produce<Int> {
-    for (x in numbers) {
-        send(x * x)
-    }
-}
-
-fun main() = runBlocking {
-    val numbers = produceNumbers()
-    val squares = square(numbers)
-    
-    repeat(5) {
-        println(squares.receive())
-    }
-    
-    coroutineContext.cancelChildren() // 子コルーチンをキャンセル
-}
-```
-
-## コルーチンコンテキストとディスパッチャー
-
-### コンテキストの要素
-
-コルーチンコンテキストは複数の要素を持ちます：
-
-```kotlin
-launch(Dispatchers.Default + CoroutineName("MyCoroutine")) {
-    println("Running in ${coroutineContext[CoroutineName]}")
-    println("Running on ${Thread.currentThread().name}")
-}
-```
-
-### コンテキストの継承
-
-```kotlin
-val scope = CoroutineScope(Job() + Dispatchers.Main)
-
-scope.launch {
-    println("Parent context: ${coroutineContext[Job]}")
-    
-    launch {
-        // 親のコンテキストを継承
-        println("Child context: ${coroutineContext[Job]}")
-    }
-}
-```
-
-## 例外ハンドリングの詳細
-
-### CoroutineExceptionHandler
-
-```kotlin
-val handler = CoroutineExceptionHandler { _, exception ->
-    println("Caught $exception")
-}
-
-val scope = CoroutineScope(Job() + handler)
-
-scope.launch {
-    throw AssertionError() // ハンドラーでキャッチされる
-}
-
-scope.launch {
-    // async内の例外はawaitで発生する
-    val deferred = async {
-        throw ArithmeticException()
-    }
-    deferred.await() // ここで例外がスロー
-}
-```
-
-### SupervisorJob
-
-子コルーチンの失敗が親に伝播しないようにする：
-
-```kotlin
-val supervisor = SupervisorJob()
-
-with(CoroutineScope(coroutineContext + supervisor)) {
-    val child1 = launch {
-        println("Child 1: starting")
-        delay(100)
-        throw Exception("Child 1 failed!")
-    }
-    
-    val child2 = launch {
-        println("Child 2: starting")
-        delay(200)
-        println("Child 2: completed")
-    }
-}
-// child1が失敗してもchild2は継続する
-```
-
-### supervisorScope
-
-特定のスコープ内だけSupervisorの振る舞いにする：
-
-```kotlin
-suspend fun doWork() {
-    supervisorScope {
-        val child1 = launch {
-            println("Child 1 failed")
-            throw Exception()
+suspend fun fetchUserWithTimeoutOrNull(userId: Long): User? = coroutineScope {
+    withTimeoutOrNull(3000) { // 3秒でタイムアウト
+        launch {
+            println("ユーザー情報取得開始: $userId")
         }
+        fetchUserFromExternalApi(userId)
+    }
+}
+
+// Springのコントローラーでの使用例
+@RestController
+class UserController {
+    suspend fun getUser(@PathVariable userId: Long): User {
+        return fetchUserWithTimeoutOrNull(userId)
+            ?: User.default() // タイムアウト時はデフォルトユーザーを返す
+    }
+}
+```
+
+#### 実務での使い方
+
+複数の並列処理すべてにタイムアウトを適用する場合。
+
+```kotlin
+suspend fun getUserProfile(userId: Long): UserProfile = coroutineScope {
+    withTimeout(5000) { // 全体で5秒以内
+        val userDeferred = async { fetchUser(userId) }
+        val ordersDeferred = async { fetchOrders(userId) }
+        val settingsDeferred = async { fetchSettings(userId) }
         
-        val child2 = launch {
-            delay(1000)
-            println("Child 2 completed")
-        }
+        UserProfile(
+            user = userDeferred.await(),
+            orders = ordersDeferred.await(),
+            settings = settingsDeferred.await()
+        )
     }
 }
 ```
 
-## Select式：複数のコルーチンを待つ
+このように、`withTimeout` は外部API呼び出しやデータベースアクセスなど、時間がかかる可能性のある処理を安全に扱うための重要なツールです。
 
-複数の suspend 関数の中で最初に完了したものを選択：
+### デバッグのコツ
 
-```kotlin
-suspend fun selectFastestApi(): String {
-    val api1 = async { fetchFromApi1() }
-    val api2 = async { fetchFromApi2() }
-    
-    return select {
-        api1.onAwait { "API1: $it" }
-        api2.onAwait { "API2: $it" }
-    }
-}
-```
+コルーチンのデバッグでよく使うテクニックを紹介します。
 
-## デバッグのコツ
-
-### コルーチン名を付ける
+#### コルーチン名を付ける
 
 ```kotlin
 launch(CoroutineName("データロード")) {
@@ -1955,7 +2087,7 @@ launch(CoroutineName("データロード")) {
 }
 ```
 
-### ログ出力でスレッド名を確認
+#### ログ出力でスレッド名を確認
 
 ```kotlin
 fun log(msg: String) = println("[${Thread.currentThread().name}] $msg")
@@ -1967,22 +2099,30 @@ fun main() = runBlocking {
 }
 ```
 
-## まとめ
+## その他の高度な機能
 
-Kotlinコルーチンの要点：
+Kotlinコルーチンには、この記事で紹介した基本機能以外にも、より高度な機能があります。実務で必要になった際に、公式ドキュメントを参照してください。
 
-1. **軽量**: 大量の並行処理が可能
-2. **一時停止可能**: `suspend` 関数でスレッドをブロックせず待機
-3. **構造化**: スコープによるライフサイクル管理
-4. **シンプル**: 非同期処理を同期的なコードのように書ける
-5. **キャンセル可能**: 協調的なキャンセルメカニズム
-6. **Flow**: 複数の値を扱う非同期ストリーム
-7. **チャネル**: コルーチン間の通信手段
-8. **例外処理**: 構造化された例外ハンドリング
+### Flow：非同期データストリーム
 
-コルーチンは最初は難しく感じるかもしれませんが、基本を理解すれば非常に強力なツールです。少しずつ使ってみて、慣れていきましょう！
+複数の値を順次返す非同期ストリームを扱うための機能です。リアクティブプログラミングのような処理に使用します。
 
-## 参考資料
+詳細は[公式ドキュメント：Asynchronous Flow](https://kotlinlang.org/docs/flow.html)を参照してください。
 
-- [Kotlin Coroutines 公式ドキュメント](https://kotlinlang.org/docs/coroutines-guide.html)
-- [Android Developers: Kotlin coroutines on Android](https://developer.android.com/kotlin/coroutines)
+### Channel：コルーチン間の通信
+
+複数のコルーチン間で値をやり取りするための機能です。プロデューサー・コンシューマーパターンなどに使用します。
+
+詳細は[公式ドキュメント：Channels](https://kotlinlang.org/docs/channels.html)を参照してください。
+
+### Select式
+
+複数のsuspend関数や非同期処理の中で、最初に完了したものを選択する機能です。
+
+詳細は[公式ドキュメント：Select Expression](https://kotlinlang.org/docs/select-expression.html)を参照してください。
+
+## 最後に
+
+コルーチンを雰囲気で使っていて、MVC→WebFluxに乗り換えようとしている人向けの記事でした。
+
+次回はリアクティブプログラミングを用いない、WebFluxについてまとめようと思ってます。
